@@ -1,22 +1,31 @@
 '''
 Heavy Ion Beam Probe partile tracing library
 '''
-import numpy as np
-import os
-import errno
-import pickle as pc
-import hibpplotlib as hbplot
-import copy
-from matplotlib import path
-from scipy.interpolate import RegularGridInterpolator
-from matplotlib.patches import Rectangle
-import matplotlib.pyplot as plt
-from itertools import cycle
-import numba
+# %% imports
 
+import os
+import copy
+import math
+import errno
+import numpy as np
+import pandas as pd
+import pickle as pc
+from itertools import cycle
+from matplotlib import path
+import matplotlib.pyplot as plt
+from joblib import Parallel, delayed # joblib=1.3.2; python>=3.11.6;
+from matplotlib.patches import Rectangle
+
+import hibpplotlib as hbplot
+import optimizers
+import hibpcalc.geomfunc as gf
+
+#from hibpcalc.fields import return_E
+from hibpcalc.fields import __return_E as return_E
+from hibpcalc.misc import runge_kutt, argfind_rv, find_fork
+from fatbeam.fatbeam_grid import fatbeam_set_new_RV0s2
 
 # %% define class for trajectories
-
 class Traj():
     '''
     Trajectory object
@@ -54,7 +63,7 @@ class Traj():
         self.Ebeam = Ebeam
         # particle velocity:
         Vabs = np.sqrt(2 * Ebeam * 1.602176634E-16 / m)
-        V0 = calc_vector(-Vabs, alpha, beta)
+        V0 = gf.calc_vector(-Vabs, alpha, beta)
         self.alpha = alpha
         self.beta = beta
         self.U = U
@@ -79,26 +88,32 @@ class Traj():
         self.IntersectGeometrySec = {'A3': False, 'B3': False, 'A4': False,
                                      'chamb': False}
         self.B_out_of_bounds = False
+        self._B_out_of_bounds_debug_info = None
+
         # multislit:
         self.fan_to_slits = []
         self.RV_sec_toslits = []
         self.ion_zones = []
         
+        # fatbeam
+        self.I0 = None # Initial Trajectory current
+
         self.log = []
 
-    def print_log(self, s): 
+    def print_log(self, s):
         self.log.append(s)
         print(s)
 
-    def pass_prim(self, E_interp, B_interp, geom, tmax=1e-5, 
-                  invisible_wall_x=5.5):
+    def pass_prim(self, E_interp, B_interp, geom, tmax=1e-5,
+                  invisible_wall_x=5.5, print_log=True):
         '''
         passing primary trajectory from initial point self.RV0
         E_interp : dictionary with E field interpolants
         B_interp : list with B fied interpolants
         geom : Geometry object
         '''
-        print('\n Passing primary trajectory')
+        if print_log:
+            print('\n Passing primary trajectory')
         # reset intersection flags
         for key in self.IntersectGeometry.keys():
             self.IntersectGeometry[key] = False
@@ -111,39 +126,30 @@ class Traj():
 
         while t <= tmax:
             r = RV_old[0, :3]
+
             # Electric field:
             E_local = return_E(r, E_interp, self.U, geom)
-            # Magnetic field:
-            # try:
-            #     B_local = return_B(r, B_interp)
-            #     # if np.isnan(B_local).any(): 
-            #     if np.isnan(B_local[0, 0]): 
-            #         self.print_log('Btor is nan, r = %s' % str(r))
-            #         break
-            #     #if np.isnan(B_local[0, 0]): break
-            # except ValueError:
-            #     self.print_log('Btor Out of bounds for primaries, r = %s' % str(r))
-            #     self.print_log(' t = %f' % t)
-            #     break
-            # !!!
-            B_local = return_B_new(r, B_interp)
-            if np.isnan(B_local).any():
-                    self.print_log('Btor is nan, r = %s' % str(r))
-                    break
-            # runge-kutta step:
-            RV_new = runge_kutt(k, RV_old, dt, E_local, B_local)
-            RV = np.vstack((RV, RV_new))
 
-            tag_column = np.hstack((tag_column, 10))
-            
-            #check if out of bounds for passing to aim
-            if RV_new[0, 0] > invisible_wall_x and RV_new[0, 1] < 1.2:
-                self.print_log('primary hit invisible wall, r = %s' % str(np.round(r, 3)))
+            # Magnetic field:
+            B_local = B_interp(r)
+            if self.check_B_is_NaN(B_local, (r, 'prim')):
                 break
 
+            # runge-kutta step:
+            RV_new = runge_kutt(k, RV_old, dt, E_local, B_local)
+
+            # check if out of bounds for passing to aim
+            if RV_new[0, 0] > invisible_wall_x and RV_new[0, 1] < 1.2:
+                if print_log:
+                    self.print_log('primary hit invisible wall, r = %s' %
+                                   str(np.round(r, 3)))
+                break
+
+            # check if intersected chamber entrance
             if geom.check_chamb_intersect('prim', RV_old[0, 0:3],
                                           RV_new[0, 0:3]):
-                self.print_log('Primary intersected chamber entrance')
+                if print_log:
+                    self.print_log('Primary intersected chamber entrance')
                 self.IntersectGeometry['chamb'] = True
                 break
 
@@ -155,22 +161,29 @@ class Traj():
                 break
 
             if geom.check_fw_intersect(RV_old[0, 0:3], RV_new[0, 0:3]):
-                self.print_log('Primary intersected first wall')
+                if print_log:
+                    self.print_log('Primary intersected first wall')
                 break  # stop primary trajectory calculation
 
+            # save results
+            RV = np.vstack((RV, RV_new))
+            tag_column = np.hstack((tag_column, 10))
             RV_old = RV_new
             t = t + dt
-            # print('t = ', t)
-        else: 
-            self.print_log('t <= tmax, t=%f' % t)
-            
+
+        else:
+            if print_log:
+                self.print_log('t <= tmax, t=%f' % t)
+            # <krokhalev> debug plot
+            # plt.figure(347)
+            # self.plot()
 
         self.RV_prim = RV
         self.tag_prim = tag_column
 
     def pass_sec(self, RV0, r_aim, E_interp, B_interp, geom,
                  stop_plane_n=np.array([1., 0., 0.]), tmax=5e-5,
-                 eps_xy=1e-3, eps_z=1e-3, invisible_wall_x=5.5):
+                 eps_xy=1e-3, eps_z=1e-3, invisible_wall_x=5.5, print_log=True):
         '''
         passing secondary trajectory from initial point RV0 to point r_aim
         with accuracy eps
@@ -180,6 +193,7 @@ class Traj():
         self.IsAimXY = False
         self.IsAimZ = False
         self.B_out_of_bounds = False
+        self._B_out_of_bounds_debug_info = None
         # reset intersection flags
         for key in self.IntersectGeometrySec.keys():
             self.IntersectGeometrySec[key] = False
@@ -192,53 +206,71 @@ class Traj():
 
         while t <= tmax:  # to witness curls initiate tmax as 1 sec
             r = RV_old[0, :3]
+
             # Electric field:
             E_local = return_E(r, E_interp, self.U, geom)
+
             # Magnetic field:
-            # try:
-            #     B_local = return_B(r, B_interp)
-            #     #if np.isnan(B_local).any(): 
-            #     #    self.print_log('Btor is nan, r = %s' % str(r))
-            #     #    break
-            #     if np.isnan(B_local[0, 0]): break
-            # except ValueError:
-            #     self.print_log('Btor Out of bounds for secondaries, r = %s' % str(np.round(r, 3)) )
-            #     self.print_log(' t = %s' % str(t))
-            #     self.B_out_of_bounds = True
-            #     break
-            #!!!
-            B_local = return_B_new(r, B_interp)
-            if np.isnan(B_local).any():
-                    self.print_log('Btor is nan, r = %s' % str(r))
-                    break
+            B_local = B_interp(r)
+            if self.check_B_is_NaN(B_local, (r, 'sec')):
+                break
+
             # runge-kutta step:
             RV_new = runge_kutt(k, RV_old, dt, E_local, B_local)
 
-        
             # #check if out of bounds for passing to aim
             if RV_new[0, 0] > invisible_wall_x:
-                self.print_log('secondary hit invisible wall, r = %s' % str(np.round(r, 3)))
+                if print_log:
+                    self.print_log(
+                        'secondary hit invisible wall, r = %s, invisible_wall_x = %s, r_aim = %s, stop_n = %s' % (
+                            str(np.round(r, 3)),
+                            str(np.round(invisible_wall_x, 3)),
+                            str(np.round(r_aim, 3)),
+                            str(np.round(stop_plane_n, 3))
+                        ))
+                # plt.figure(553)
+                # plt.plot(RV[:, 0], RV[:, 1])
+                # plt.plot(RV[:, 0], RV[:, 2])
+
+                # plt.plot(self.RV_prim[:, 0], self.RV_prim[:, 1])
+                # plt.plot(self.RV_prim[:, 0], self.RV_prim[:, 2])
+
+                # raise Exception("???")
+
                 break
-                
+
             if geom.check_chamb_intersect('sec', RV_old[0, 0:3],
                                           RV_new[0, 0:3]):
                 # print('Secondary intersected chamber exit')
                 self.IntersectGeometrySec['chamb'] = True
 
-            plts_flag, plts_name = geom.check_plates_intersect(RV_old[0, 0:3],
-                                                               RV_new[0, 0:3])
+            plts_flag, plts_name = geom.check_plates_intersect(
+                RV_old[0, 0:3], RV_new[0, 0:3])
             if plts_flag:
-                self.print_log('Secondary intersected ' + plts_name + ' plates')
+                if print_log:
+                    self.print_log('Secondary intersected ' +
+                                   plts_name + ' plates')
                 self.IntersectGeometrySec[plts_name] = True
 
             # find last point of the secondary trajectory
-            if (RV_new[0, 0] > 2.5) and (RV_new[0, 1] < 1.5):
+            # if (RV_new[0, 0] > 2.45) and (RV_new[0, 1] < 1.5):
+            if (RV_new[0, 0] > r_aim[0] - 0.085) and (RV_new[0, 1] < 1.5):
                 # intersection with the stop plane:
-                r_intersect = line_plane_intersect(stop_plane_n, r_aim,
-                                                   RV_new[0, :3]-RV_old[0, :3],
-                                                   RV_new[0, :3])
+
+                #!!! original code
+                r_intersect = gf.line_plane_intersect(
+                    stop_plane_n, r_aim, RV_new[0, :3]-RV_old[0, :3], RV_new[0, :3])
+                # _r_intersect = gf.plane_segment_intersect(stop_plane_n, r_aim, RV_old[0, :3], RV_new[0, :3])
+
+                # r_intersect = plane_segment_intersect(stop_plane_n, r_aim,
+                #                                       RV_old[0, :3], RV_new[0, :3])
                 # check if r_intersect is between RV_old and RV_new:
-                if is_between(RV_old[0, :3], RV_new[0, :3], r_intersect):
+
+                #!!! original code
+                if gf.is_between(RV_old[0, :3], RV_new[0, :3], r_intersect):
+
+                    # if not np.isnan(r_intersect):  # if r_sect is not None:
+                    # if r_intersect is not None:
                     RV_new[0, :3] = r_intersect
                     RV = np.vstack((RV, RV_new))
                     # check XY plane:
@@ -246,11 +278,14 @@ class Traj():
                         # print('aim XY!')
                         self.IsAimXY = True
                     # check XZ plane:
-                    if (np.linalg.norm(RV_new[0, [0, 2]] - r_aim[[0, 2]]) <=
-                            eps_z):
+                    if (np.linalg.norm(RV_new[0, [0, 2]] - r_aim[[0, 2]]) <= eps_z):
                         # print('aim Z!')
                         self.IsAimZ = True
                     break
+                # else:
+                #     if _r_intersect is not None:
+                #         print('WTF??')
+                #         raise Exception("WTF???")
 
             # continue trajectory calculation:
             RV_old = RV_new
@@ -259,18 +294,25 @@ class Traj():
             tag_column = np.hstack((tag_column, 20))
             # print('t secondary = ', t)
 
+        else:
+            if print_log:
+                self.print_log("max time exceeded during passing secondary")
+            # <krokhalev> debug plot
+            # plt.figure(348)
+            # self.plot()
+
         self.RV_sec = RV
         self.tag_sec = tag_column
 
     def pass_fan(self, r_aim, E_interp, B_interp, geom,
                  stop_plane_n=np.array([1., 0., 0.]), eps_xy=1e-3, eps_z=1e-3,
-                 no_intersect=False, no_out_of_bounds=False, 
+                 no_intersect=False, no_out_of_bounds=False,
                  invisible_wall_x=5.5):
         '''
         passing fan from initial point self.RV0
         '''
         print('\n Passing fan of trajectories')
-        self.pass_prim(E_interp, B_interp, geom, 
+        self.pass_prim(E_interp, B_interp, geom,
                        invisible_wall_x=invisible_wall_x)
         # create a list fro secondary trajectories:
         list_sec = []
@@ -284,17 +326,18 @@ class Traj():
         # 1.5 m - major radius of a torus, elon - size along Y
         mask = np.sqrt((self.RV_prim[:, 0] - geom.R)**2 +
                        (self.RV_prim[:, 1] / geom.elon)**2) <= geom.r_plasma
-        
+
         self.tag_prim[mask] = 11
 
         # list of initial points of secondary trajectories:
-        RV0_sec = self.RV_prim[(self.tag_prim == 11)]
+        # RV0_sec = self.RV_prim[(self.tag_prim == 11)]
+        RV0_sec = self.RV_prim[mask]
 
         for RV02 in RV0_sec:
             RV02 = np.array([RV02])
             self.pass_sec(RV02, r_aim, E_interp, B_interp, geom,
                           stop_plane_n=stop_plane_n,
-                          eps_xy=eps_xy, eps_z=eps_z, 
+                          eps_xy=eps_xy, eps_z=eps_z,
                           invisible_wall_x=invisible_wall_x)
             if (no_intersect and True in self.IntersectGeometrySec.values()) or \
                (no_out_of_bounds and self.B_out_of_bounds):
@@ -306,20 +349,23 @@ class Traj():
     def pass_to_target(self, r_aim, E_interp, B_interp, geom,
                        stop_plane_n=np.array([1., 0., 0.]),
                        eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10,
-                       no_intersect=False, no_out_of_bounds=False, 
+                       no_intersect=False, no_out_of_bounds=False,
                        invisible_wall_x=5.5):
         '''
         find secondary trajectory which goes directly to target
         '''
+
         if True in self.IntersectGeometry.values():
             print('There is intersection at primary trajectory')
             return
         if len(self.Fan) == 0:
             print('NO secondary trajectories')
             return
+
         # reset flags in order to let the algorithm work properly
         self.IsAimXY = False
         self.IsAimZ = False
+
         # reset intersection flags for secondaries
         for key in self.IntersectGeometrySec.keys():
             self.IntersectGeometrySec[key] = False
@@ -353,28 +399,28 @@ class Traj():
         while True:
             # make a small step along primary trajectory
             r = RV_old[0, :3]
-            # try:
-            #     B_local = return_B(r, B_interp)
-            #     # if np.isnan(B_local).any(): 
-            #     #     self.print_log('Btor is nan, r = %s' % str(r))
-            #     #     break
-            #     if np.isnan(B_local[0, 0]): break
-            # except ValueError:
-            #     print('B out of bounds while passing secondary to target')
-            #     break
-            #!!!
-            B_local = return_B_new(r, B_interp)
-            if np.isnan(B_local).any():
-                    self.print_log('Btor is nan, r = %s' % str(r))
-                    break
-                
+
+            # fields
             E_local = np.array([0., 0., 0.])
+            B_local = B_interp(r)
+            if np.isnan(B_local).any():
+                # self.print_log('Btor is nan, r = %s' % str(r))
+                break
+
+            # runge-kutta step
             RV_new = runge_kutt(self.q / self.m, RV_old, self.dt1,
                                 E_local, B_local)
+
+            # check if RV_new is in plasma
+            if not (np.sqrt((RV_new[:, 0] - geom.R)**2 +
+                            (RV_new[:, 1] / geom.elon)**2) <= geom.r_plasma):
+                self.print_log("out of plasma during passing to target")
+                break
+
             # pass new secondary trajectory
             self.pass_sec(RV_new, r_aim, E_interp, B_interp, geom,
                           stop_plane_n=stop_plane_n,
-                          eps_xy=eps_xy, eps_z=eps_z, 
+                          eps_xy=eps_xy, eps_z=eps_z,
                           invisible_wall_x=invisible_wall_x)
             # check XY flag
             if self.IsAimXY:
@@ -382,14 +428,16 @@ class Traj():
                 # find the index of the point in primary traj closest to RV_new
                 ind = np.nanargmin(np.linalg.norm(self.RV_prim[:, :3] -
                                                   RV_new[0, :3], axis=1))
-                if is_between(self.RV_prim[ind, :3],
-                              self.RV_prim[ind+1, :3], RV_new[0, :3], eps=1e-4):
+                if gf.is_between(self.RV_prim[ind, :3],
+                                 self.RV_prim[ind+1, :3], RV_new[0, :3]):
                     i2insert = ind+1
                 else:
                     i2insert = ind
-                self.RV_prim = np.insert(self.RV_prim, i2insert, RV_new, axis=0)
+                self.RV_prim = np.insert(
+                    self.RV_prim, i2insert, RV_new, axis=0)
                 self.tag_prim = np.insert(self.tag_prim, i2insert, 11, axis=0)
                 break
+
             # check if the new secondary traj is lower than r_aim
             if (not twisted_fan and
                     np.sign(np.cross(self.RV_sec[-1, :3], r_aim)[-1]) > 0):
@@ -414,22 +462,25 @@ class Traj():
             self.RV_sec_toslits = [None]*n_slits
             self.ion_zones = [None]*n_slits
 
-    def plot_prim(self, ax, axes='XY', color='k', full_primary=False):
+    def plot_prim(self, ax, axes='XY', color='k', full_primary=False, alpha=1):
         '''
         plot primary trajectory
         '''
         axes_dict = {'XY': (0, 1), 'XZ': (0, 2), 'ZY': (2, 1)}
         index_X, index_Y = axes_dict[axes]
         index = -1
+
+        if min(self.RV_sec.shape) == 0:
+            full_primary = True
+
         if not full_primary:
             # find where secondary trajectory starts:
             for i in range(self.RV_prim.shape[0]):
-                if np.linalg.norm(self.RV_prim[i, :3]
-                                  - self.RV_sec[0, :3]) < 1e-4:
+                if np.linalg.norm(self.RV_prim[i, :3] - self.RV_sec[0, :3]) < 1e-4:
                     index = i+1
         ax.plot(self.RV_prim[:index, index_X],
                 self.RV_prim[:index, index_Y],
-                color=color, linewidth=2)
+                color=color, linewidth=2, alpha=alpha)
 
     def plot_sec(self, ax, axes='XY', color='r'):
         '''
@@ -449,9 +500,328 @@ class Traj():
         for i in self.Fan:
             ax.plot(i[:, index_X], i[:, index_Y], color=color)
 
+# %% new traj functions !!! TO BE TESTED !!!
+    # def _plot_fan(self, ax, axes='XY', color='r', indexces=):
+    #     '''
+    #     plot fan of secondary trajectories
+    #     '''
+    #     axes_dict = {'XY': (0, 1), 'XZ': (0, 2), 'ZY': (2, 1)}
+    #     index_X, index_Y = axes_dict[axes]
+    #     for i in self.Fan:
+    #         ax.plot(i[:, index_X], i[:, index_Y], color=color)
+
+    def plot(self, ax=None, axes='XY', color='r'):
+        if ax is None:
+            ax = plt.gca()
+        self.plot_prim(ax, axes=axes, color='black')
+        try:
+            self.plot_sec(ax, axes=axes, color=color)
+        except:
+            pass
+
+    def reset_sec_flags(self):
+        '''
+        Sets aim, b_out_of_bounds and intersection flags to False
+
+        Returns
+        -------
+        None.
+
+        '''
+        self.IsAimXY = False
+        self.IsAimZ = False
+        self.B_out_of_bounds = False
+        self._B_out_of_bounds_debug_info = None
+
+        for key in self.IntersectGeometrySec.keys():
+            self.IntersectGeometrySec[key] = False
+
+    def check_sec_intersection(self, RV_old, RV_new):
+        '''
+        Checks if last step of econdadry trajectory intersect geometry or plates
+
+
+        Parameters
+        ----------
+        RV_old : TYPE
+            DESCRIPTION.
+        RV_new : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        bool
+            True if RV_new out of bounds
+        '''
+
+    def _pass_sec(self, RV0, r_aim, E_interp, B_interp, geom,
+                  stop_plane_n=np.array([1., 0., 0.]), tmax=5e-5,
+                  eps_xy=1e-3, eps_z=1e-3, invisible_wall_x=5.5, break_at_intersection=False):
+        '''
+        passing secondary trajectory from initial point RV0 to point r_aim
+        with accuracy eps.
+        #!!!
+        Parameters
+        ----------
+        RV0 : TYPE
+            Initial position and velocity
+        r_aim : TYPE
+            DESCRIPTION.
+        E_interp : TYPE
+            DESCRIPTION.
+        B_interp : TYPE
+            DESCRIPTION.
+        geom : TYPE
+            DESCRIPTION.
+        stop_plane_n : np.array with shape (3,), optional
+            Normal vector to the plane there secolndary trajectory will be cut.
+            The default is np.array([1., 0., 0.]).
+        tmax : float64, optional
+            DESCRIPTION. The default is 5e-5.
+        eps_xy : float64, optional
+            DESCRIPTION. The default is 1e-3.
+        eps_z : float64, optional
+            DESCRIPTION. The default is 1e-3.
+        invisible_wall_x : float64, optional
+            DESCRIPTION. The default is 5.5.
+
+        Returns
+        -------
+        None.
+
+        '''
+        self.reset_sec_flags()
+
+        # set initial parameters
+        t = 0.
+        dt = self.dt2
+        RV_old = RV0  # initial position
+        RV = RV0  # array to collect all [r,V]
+        k = 2*self.q / self.m
+        tag_column = [20]
+
+        # pass trajectory
+        while t <= tmax:  # to witness curls initiate tmax as 1 sec
+            r = RV_old[0, :3]
+
+            # fields
+            E_local = return_E(r, E_interp, self.U, geom)
+            B_local = B_interp(r)
+            if self.check_B_is_NaN(B_local, (r, '_sec')):
+                break
+
+            # runge-kutta step:
+            RV_new = runge_kutt(k, RV_old, dt, E_local, B_local)
+
+            # check if out of bounds for passing to aim
+            if RV_new[0, 0] > invisible_wall_x:
+                self.print_log('secondary hit invisible wall, r = %s' %
+                               str(np.round(r, 3)))
+                break
+
+            # check if intersected geometry or plates
+            if geom.check_chamb_intersect('sec', RV_old[0, 0:3], RV_new[0, 0:3]):
+                self.IntersectGeometrySec['chamb'] = True
+                if break_at_intersection:
+                    break
+
+            plts_flag, plts_name = geom.check_plates_intersect(RV_old[0, 0:3],
+                                                               RV_new[0, 0:3])
+            if plts_flag:
+                self.print_log('Secondary intersected ' +
+                               plts_name + ' plates')
+                self.IntersectGeometrySec[plts_name] = True
+                if plts_name in self.U.keys():
+                    if break_at_intersection and not np.isclose(self.U[plts_name], 0., 1e-6):
+                        break
+
+            # find last point of the secondary trajectory
+            # if (RV_new[0, 0] > 2.5) and (RV_new[0, 1] < 1.5):
+            if (RV_new[0, 0] > r_aim[0] - 0.15) and (RV_new[0, 1] < 1.5):
+                # RV_new[0, 4] > 0.0 # Vx > 0
+                # intersection with the stop plane:
+                r_intersect = gf.plane_segment_intersect(stop_plane_n, r_aim,
+                                                         RV_old[0, :3], RV_new[0, :3])
+                if r_intersect is not None:
+
+                    # cut trajectory
+                    RV_new[0, :3] = r_intersect
+                    RV = np.vstack((RV, RV_new))
+
+                    # check XY plane:
+                    if (np.linalg.norm(RV_new[0, :2] - r_aim[:2]) <= eps_xy):  # !!!
+                        self.IsAimXY = True
+
+                    # check XZ plane:
+                    if (np.linalg.norm(RV_new[0, [0, 2]] - r_aim[[0, 2]]) <= eps_z):  # !!!
+                        self.IsAimZ = True
+                    break
+
+            # continue trajectory calculation:
+            RV_old = RV_new
+            t = t + dt
+            RV = np.vstack((RV, RV_new))
+            tag_column = np.hstack((tag_column, 20))
+
+        else:
+            self.print_log("max time exceeded during passing secondary")
+            # <krokhalev> debug plot
+            # plt.figure(348)
+            # self.plot()
+
+        self.RV_sec = RV
+        self.tag_sec = tag_column
+
+    def check_B_is_NaN(self, B_local, debug_info=None):
+        if np.isnan(B_local).any():
+            self.B_out_of_bounds = True
+            self._B_out_of_bounds_debug_info = debug_info  # '_pass_to_target'
+            # self.print_log('Btor is nan, r = %s' % str(r))
+            return True
+        else:
+            return False
+
+    def _pass_to_target(self, r_aim, E_interp, B_interp, geom,
+                        stop_plane_n=np.array([1., 0., 0.]),
+                        eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10,
+                        no_intersect=False, no_out_of_bounds=False,
+                        invisible_wall_x=5.5):
+        '''
+        find secondary trajectory which goes directly to target
+        '''
+
+        k = self.q / self.m
+
+        if True in self.IntersectGeometry.values():
+            print('There is intersection at primary trajectory')
+            return
+        if len(self.Fan) == 0:
+            print('NO secondary trajectories')
+            return
+
+        # reset flags in order to let the algorithm work properly
+        self.IsAimXY = False
+        self.IsAimZ = False
+
+        # reset intersection flags for secondaries
+        for key in self.IntersectGeometrySec.keys():
+            self.IntersectGeometrySec[key] = False
+
+        twisted_fan = self.check_twist(r_aim)
+
+        sec_tr_index, linear_param = self.find_fork_for_aim(
+            r_aim, stop_plane_n)
+
+        if linear_param is None:
+            return
+
+        # use runge-kutta to make small step along prim traj
+
+        # set start point
+        RV_old = np.array([self.Fan[sec_tr_index][0]])
+
+        # read fields
+        E_local = return_E(RV_old[0, 0:3], E_interp, self.U, geom)
+        B_local = B_interp(RV_old[0, 0:3])
+        if self.check_B_is_NaN(B_local, (RV_old[0, 0:3], '_pass_to_target')):
+            raise Exception(
+                "somehow B is None in the middle of primary trajectory")
+
+        dt = self.dt1*linear_param
+        RV_new = runge_kutt(k, RV_old, dt, E_local, B_local)
+
+        # pass new secondary trajectory
+        self.pass_sec(RV_new, r_aim, E_interp, B_interp, geom,
+                      stop_plane_n=stop_plane_n,
+                      eps_xy=eps_xy, eps_z=eps_z,
+                      invisible_wall_x=invisible_wall_x)
+
+        # check XY flag
+        if self.IsAimXY:
+            # insert RV_new into primary traj
+            # find the index of the point in primary traj closest to RV_new
+            ind_prim = argfind_rv(self.RV_prim, RV_old[0])
+            i2insert = ind_prim + 1
+            self.RV_prim = np.insert(self.RV_prim, i2insert, RV_new, axis=0)
+            self.tag_prim = np.insert(self.tag_prim, i2insert, 11, axis=0)
+        else:
+            ind_prim = argfind_rv(self.RV_prim, RV_old[0])
+            i2insert = ind_prim + 1
+            # print( "difference along vertical", np.linalg.norm(RV_new[0, :2] - r_aim[:2]) )
+            # print("linear coeff = ", linear_param)
+            # print("prim index =", ind_prim)
+            # print("Fan index =", sec_tr_index)
+            # plt.figure(555)
+            # self.plot_prim(plt.gca())
+            # self.plot_sec(plt.gca())
+            # self.plot_fan(plt.gca())
+            # plt.figure(556)
+            # self.plot_prim(plt.gca(), axes='XZ')
+            # self.plot_sec(plt.gca(), axes='XZ')
+            # self.plot_fan(plt.gca(), axes='XZ')
+            # raise Exception("didn't make it in the first attempt")
+            pass  # !!!
+
+    def check_twist(self, r_aim):
+
+        # find which secondaries are higher/lower than r_aim
+        # sign = -1 means higher, 1 means lower
+        signs = np.array([np.sign(np.cross(RV[-1, :3], r_aim)[-1])
+                          for RV in self.Fan])
+        are_higher = np.argwhere(signs == -1)
+        are_lower = np.argwhere(signs == 1)
+        twisted_fan = False  # flag to detect twist of the fan
+
+        try:
+            if are_higher[-1] > are_lower[0]:
+                print('Fan is twisted!')
+                twisted_fan = True
+            else:
+                self.fan_ok = True
+        except IndexError:
+            self.print_log("can't check if fan is twisted")
+            return None
+
+        return twisted_fan
+
+    def find_fork_for_aim(self, r_aim, stop_plane_n=np.array([1., 0., 0.])):
+        '''
+        find 2 sec trajectories: 1st is higher than aim, 2nd is lower 
+        calc linear parameter t: 0..1 : 0 if r_aim is at 1st traj, 1 if at 2nd
+        '''
+
+        # set basis
+        v, h = gf.vert_horz_basis(stop_plane_n)
+        t = None
+        idx = None
+
+        for i, (rrvv1, rrvv2) in enumerate(zip(self.Fan[0:-1], self.Fan[1:])):
+            # take last dot
+            rv1 = rrvv1[-1, 0:3]
+            rv2 = rrvv2[-1, 0:3]
+
+            # find vertical difference between last dots and aim
+            d1 = (rv1 - r_aim).dot(v)
+            d2 = (rv2 - r_aim).dot(v)
+
+            # check if last dots on different sides of aim
+            if d1*d2 <= 0:
+                # calc t
+                t = abs(d1/(d1 - d2))
+                idx = i
+                break
+
+        if t is None:
+            self.print_log(
+                "can't find fork, all secondaries higher or lower than aim")
+
+        return idx, t  # !!!
 
 # %% define class for plates
+
+
 class Plates():
+
     '''
     object containing info on deflecting plates
     '''
@@ -477,10 +847,31 @@ class Plates():
         self.beamline = beamline
         self.r = r
 
+        self.rotation_mx = gf.identMx()
+        self.inv_rotation_mx = gf.identMx()
+
+        # gabarits
+        self.min_corners = None
+        self.max_corners = None
+
+        # direct:  v = plate.rotation_mx.dot(v).A1 + plate.r
+        # inverse: v = plate.inv_rotation_mx.dot(v - plate.r).A1 # to original/native coordinates
+
+    def recalc_gabarits(self, E_interp):
+        g = E_interp[self.name].grid
+        edges = [g[:,  0, 0, 0],  g[:,  0, 0, -1], g[:,  0, -1, 0], g[:,  0, -1, -1],
+                 g[:, -1, 0, 0],  g[:, -1, 0, -1], g[:, -1, -1, 0], g[:, -1, -1, -1]]
+
+        edges_ = np.array([self.rotation_mx.dot(e) + self.r for e in edges])
+
+        self.min_corners = np.min(edges_, axis=0)
+        self.max_corners = np.max(edges_, axis=0)
+
     def set_edges(self, edges):
         '''
         set coordinates of plates edges
         '''
+        self.original_edges = copy.deepcopy(edges)
         self.edges = edges
 
     def rotate(self, angles, beamline_angles, inverse=False):
@@ -489,10 +880,18 @@ class Plates():
         '''
         self.angles = angles
         self.beamline_angles = beamline_angles
+
+        self.r = gf.rotate3(self.r, angles, beamline_angles,
+                            inverse=inverse)  # !!!
+
         for i in range(self.edges.shape[0]):
-            self.edges[i, :] = rotate3(self.edges[i, :],
-                                       angles, beamline_angles,
-                                       inverse=inverse)
+            self.edges[i, :] = gf.rotate3(
+                self.edges[i, :], angles, beamline_angles, inverse=inverse)
+
+        # remember the transformation
+        mx = gf.get_rotate3_mx(angles, beamline_angles, inverse=inverse)
+        self.rotation_mx = mx.dot(self.rotation_mx)
+        self.inv_rotation_mx = np.matrix(self.rotation_mx).I.A
 
     def shift(self, r_new):
         '''
@@ -505,34 +904,103 @@ class Plates():
         '''
         check intersection with a segment point1 -> point2
         '''
+        #c1, c2 = self.min_corners, self.max_corners
+        # if np.any(point1 < c1)and np.any(point2 < c1):
+        #    return False
+        # if np.any(point1 > c2)and np.any(point2 > c2):
+        #    return False
+
         segment_coords = np.array([point1, point2])
-        if segm_poly_intersect(self.edges[0][:4], segment_coords) or \
-           segm_poly_intersect(self.edges[1][:4], segment_coords):
+        if gf.segm_poly_intersect(self.edges[0][:4], segment_coords) or \
+           gf.segm_poly_intersect(self.edges[1][:4], segment_coords):
             return True
         # if plates are flared
         if self.edges.shape[1] > 4:
             # for flared plates the sequence of vertices is
             # [UP1sw, UP1, UP2, UP2sw, UP3, UP4]
             point_ind = [1, 5, 4, 2]
-            if segm_poly_intersect(self.edges[0][point_ind], segment_coords) or \
-               segm_poly_intersect(self.edges[1][point_ind], segment_coords):
+            if gf.segm_poly_intersect(self.edges[0][point_ind], segment_coords) or \
+               gf.segm_poly_intersect(self.edges[1][point_ind], segment_coords):
                 return True
             # intersection with flared part
             point_ind = [0, 1, 2, 3]
-            if segm_poly_intersect(self.edges[0][point_ind], segment_coords) or \
-               segm_poly_intersect(self.edges[1][point_ind], segment_coords):
+            if gf.segm_poly_intersect(self.edges[0][point_ind], segment_coords) or \
+               gf.segm_poly_intersect(self.edges[1][point_ind], segment_coords):
                 return True
         return False
 
-    def plot(self, ax, axes='XY'):
+    def plot(self, ax, axes='XY', **kwargs):  # <reonid: add **kwargs> #!!!
         '''
         plot plates
         '''
-        index_X, index_Y = get_index(axes)
+        index_X, index_Y = gf.get_index(axes)
         ax.fill(self.edges[0][:, index_X], self.edges[0][:, index_Y],
-                fill=False, hatch='\\', linewidth=2)
-        ax.fill(self.edges[1][:, index_X], self.edges[1][:, index_Y],
-                fill=False, hatch='/', linewidth=2)
+                fill=False, hatch='\\', linewidth=2, **kwargs)
+        ax.fill(self.edges[1][:, index_X], self.edges[1][:,
+                index_Y], fill=False, hatch='/', linewidth=2, **kwargs)
+
+    def _rect(self, ii, jj):
+        i0, i1 = ii
+        j0, j1 = jj
+        return [self.edges[i0, j0], self.edges[i1, j0], self.edges[i1, j1], self.edges[i0, j1]]
+
+    def front_rect(self):
+        # checked for A3
+        if self.edges.shape[1] > 4:
+            return self._rect((0, 1), (1, 2))
+        return [self.edges[0, 0], self.edges[1, 0], self.edges[1, 1], self.edges[0, 1]]
+
+    def front_basis(self, norm=True):
+        r = self.front_rect()
+        v1 = r[0] - r[1]     # up
+        v2 = r[0] - r[-1]    # right
+        if norm:
+            # , along_vector
+            return [v1/np.linalg.norm(v1),  v2/np.linalg.norm(v2)]
+        else:
+            return [v1*0.5,  v2*0.5]
+
+    def return_r_in_original_coordinates(self, geom, r):
+        # return self.inv_rotation_mx.dot(r - self.r)
+
+        r_new = r - geom.r_dict[self.name]
+        # get angles
+        angles = self.angles
+        beamline_angles = self.beamline_angles
+        # rotate point to the coord system of plates
+        r_new = gf.rotate3(r_new, angles, beamline_angles, inverse=True)
+        return r_new
+
+    def original_plates(self, geom):
+        _pl = copy.deepcopy(self)
+        dr = geom.r_dict[self.name]
+        angles = self.angles
+        beamline_angles = self.beamline_angles
+
+        _pl.shift(-dr)
+        _pl.rotate(angles, beamline_angles, inverse=True)
+        return _pl
+
+    def contains_point(self, geom, r):
+        # !!! not for flare plates
+        if self.edges.shape[1] > 4:
+            raise Exception('for flared plates not implemented yet')
+        _r = self.return_r_in_original_coordinates(geom, r)
+
+        _pl = self.original_plates(geom)
+
+        xmin = np.min(_pl.edges, axis=(1, 0))[0]
+        ymin = np.min(_pl.edges, axis=(1, 0))[1]
+        zmin = np.min(_pl.edges, axis=(1, 0))[2]
+
+        xmax = np.max(_pl.edges, axis=(1, 0))[0]
+        ymax = np.max(_pl.edges, axis=(1, 0))[1]
+        zmax = np.max(_pl.edges, axis=(1, 0))[2]
+
+        _min_r = np.array([xmin, ymin, zmin])
+        _max_r = np.array([xmax, ymax, zmax])
+
+        return np.all(_r - _min_r >= 0.0) and np.all(_r - _max_r <= 0.0)
 
 
 # %% class for Analyzer
@@ -598,25 +1066,26 @@ class Analyzer(Plates):
         return(np.array([self.n_slits, self.slit_dist, self.slit_w, self.G,
                          self.theta, self.XD, self.YD1, self.YD2]))
 
-    def rotate(self, angles, beamline_angles):
+    def rotate(self, angles, beamline_angles, inverse=False):
         '''
         rotate all the coordinates around the axis with beamline_angles
         '''
-        super().rotate(angles, beamline_angles)
+        super().rotate(angles, beamline_angles, inverse)
         for attr in [self.slits_edges, self.slits_spot,
                      self.det_edges, self.det_spot]:
             if len(attr.shape) < 2:
-                attr = rotate3(attr, angles, beamline_angles)
+                attr = gf.rotate3(attr, angles, beamline_angles, inverse)
             else:
                 for i in range(attr.shape[0]):
-                    attr[i, :] = rotate3(attr[i, :], angles, beamline_angles)
+                    attr[i, :] = gf.rotate3(
+                        attr[i, :], angles, beamline_angles, inverse)
         # recalculate normal to slit plane:
-        self.slit_plane_n = calc_normal(self.slits_edges[0, 0, :],
-                                        self.slits_edges[0, 1, :],
-                                        self.slits_edges[0, 2, :])
-        self.det_plane_n = calc_normal(self.det_edges[0, 0, :],
-                                       self.det_edges[0, 1, :],
-                                       self.det_edges[0, 2, :])
+        self.slit_plane_n = gf.calc_normal(self.slits_edges[0, 0, :],
+                                           self.slits_edges[0, 1, :],
+                                           self.slits_edges[0, 2, :])
+        self.det_plane_n = gf.calc_normal(self.det_edges[0, 0, :],
+                                          self.det_edges[0, 1, :],
+                                          self.det_edges[0, 2, :])
 
     def shift(self, r_new):
         '''
@@ -634,7 +1103,7 @@ class Analyzer(Plates):
         # plot plates
         super().plot(ax, axes=axes)
         # choose which slits to plot
-        index_X, index_Y = get_index(axes)
+        index_X, index_Y = gf.get_index(axes)
         if n_slit == 'all':
             slits = range(self.slits_edges.shape[0])
         else:
@@ -660,7 +1129,18 @@ class Analyzer(Plates):
             ax.fill(spot[:, index_X], spot[:, index_Y], fill=False)
 
 
+def createplates(name, beamline, an_params=None):
+    if name == 'an':
+        # create new Analyzer object
+        plts = Analyzer(name, beamline)
+        plts.add_slits(an_params)
+    else:
+        plts = Plates(name, beamline)
+    return plts
+
 # %%
+
+
 def define_slits(r0, slit_angles, n_slits, slit_dist, slit_w, slit_l):
     '''
     calculate coordinates of slits edges with central slit at r0
@@ -679,13 +1159,13 @@ def define_slits(r0, slit_angles, n_slits, slit_dist, slit_w, slit_l):
         r_slits[i_slit, 4, :] = [0., y0 + slit_w/2, -slit_l/2]
         # rotate and shift to slit position:
         for j in range(5):
-            r_slits[i_slit, j, :] = rotate3(r_slits[i_slit, j, :],
-                                            slit_angles, slit_angles)
+            r_slits[i_slit, j, :] = gf.rotate3(r_slits[i_slit, j, :],
+                                               slit_angles, slit_angles)
             r_slits[i_slit, j, :] += r0
 
     # calculate normal to slit plane:
-    slit_plane_n = calc_normal(r_slits[0, 0, :], r_slits[0, 1, :],
-                               r_slits[0, 2, :])
+    slit_plane_n = gf.calc_normal(r_slits[0, 0, :], r_slits[0, 1, :],
+                                  r_slits[0, 2, :])
 
     # create polygon, which contains all slits (slits spot):
     slits_spot = 1.5*np.vstack([r_slits[0, [1, 4], :] - r0,
@@ -693,17 +1173,9 @@ def define_slits(r0, slit_angles, n_slits, slit_dist, slit_w, slit_l):
 
     return r_slits, slit_plane_n, slits_spot
 
-
-# %%
-def calc_normal(point1, point2, point3):
-    '''
-    calculate vector normal to a plane defined by 3 points
-    '''
-    plane_n = np.cross(point1 - point2, point1 - point3)
-    return plane_n/np.linalg.norm(plane_n)
-
-
 # %% define class for geometry
+
+
 class Geometry():
     '''
     object containing geometry points
@@ -716,6 +1188,17 @@ class Geometry():
         self.r_dict = dict()
         # arrays for primary and secondary beamline angles:
         self.angles_dict = dict()
+        # array for slits coordinates:
+        self.slits_edges = np.array([])
+        # array for slit normal:
+        self.slit_plane_n = np.array([])
+        # array for slit polygon:
+        self.slits_spot = np.array([])
+        # arrays for primary and secondary beamline angles:
+        self.prim_angles = np.array([])
+        self.sec_angles = np.array([])
+        # array for Analyzer parameters
+        self.an_params = np.array([])
         # determining chamber entrance and exit:
         self.chamb_ent = []
         self.chamb_ext = []
@@ -735,6 +1218,26 @@ class Geometry():
         self.r_plasma = 0
         self.elon = 0
 
+    def add_slits(self, n_slits, slit_dist, slit_w, slit_l):
+        ''' add slits to Geometry
+        n_slits - number of slits
+        slit_dist - distance between centers of the slits [m]
+        slit_w - slit width (along Y) [m]
+        slit_l - slit length (along Z)
+        slit_gamma - angle of ratation around X [deg]
+        '''
+        # angles of the slits plane normal
+        angles = copy.deepcopy(self.angles_dict)
+        # coords of center of the central slit
+        rs = self.r_dict['slit']
+
+        r_slits, slit_plane_n, slits_spot = define_slits(rs, angles,
+                                                         n_slits, slit_dist,
+                                                         slit_w, slit_l)
+        self.slits_edges = r_slits
+        self.slit_plane_n = slit_plane_n
+        self.slits_spot = slits_spot
+
     def check_chamb_intersect(self, beamline, point1, point2):
         '''
         check intersection between segment 1->2 and chamber
@@ -743,21 +1246,21 @@ class Geometry():
         # do not check intersection when particle is far from chamber
         if (point1[0] > 2.5 and point2[1] > 1.5) or \
            (point1[0] < 2.0 and point2[1] < 0.8):
-               return intersect_flag
+            return intersect_flag
         if beamline == 'prim':
             # check intersection with chamber entrance
             # if len(self.chamb_ent) == 0: return False
             for i in np.arange(0, len(self.chamb_ent), 2):
                 intersect_flag = intersect_flag or \
-                    is_intersect(point1[0:2], point2[0:2],
-                                   self.chamb_ent[i], self.chamb_ent[i+1])
+                    gf.is_intersect(point1[0:2], point2[0:2],
+                                    self.chamb_ent[i], self.chamb_ent[i+1])
         elif beamline == 'sec':
             # check intersection with chamber exit
             # if len(self.chamb_ext) == 0: return False
             for i in np.arange(0, len(self.chamb_ext), 2):
                 intersect_flag = intersect_flag or \
-                    is_intersect(point1[0:2], point2[0:2],
-                                   self.chamb_ext[i], self.chamb_ext[i+1])
+                    gf.is_intersect(point1[0:2], point2[0:2],
+                                    self.chamb_ext[i], self.chamb_ext[i+1])
         return intersect_flag
 
     def check_fw_intersect(self, point1, point2):
@@ -771,8 +1274,8 @@ class Geometry():
         # check intersection with first wall
         for i in np.arange(4, len(self.out_fw), 2):
             intersect_flag = intersect_flag or \
-                is_intersect(point1[0:2], point2[0:2],
-                             self.out_fw[i], self.out_fw[i+1])
+                gf.is_intersect(point1[0:2], point2[0:2],
+                                self.out_fw[i], self.out_fw[i+1])
         return intersect_flag
 
     def check_plates_intersect(self, point1, point2):
@@ -780,15 +1283,12 @@ class Geometry():
         check intersection between segment 1->2 and plates
         '''
         # do not check intersection when particle is outside beamlines
-        if point2[0] < self.r_dict['aim'][0]-0.05 and \
-           point1[1] < self.r_dict['port_in'][1]:
+        if point2[0] < self.r_dict['aim'][0]-0.05 and point1[1] < self.r_dict['port_in'][1]:
             return False, 'none'
         for key in self.plates_dict.keys():
             # check if a point in inside the beamline
-            if (key in ['A1', 'B1', 'A2', 'B2'] and
-                point1[1] > self.r_dict['port_in'][1]) or \
-                (key in ['A3', 'A3d', 'B3', 'A4', 'A4d', 'B4'] and
-                 point2[0] > self.r_dict['aim'][0]-0.05):
+            if (key in ['A1', 'B1', 'A2', 'B2'] and point1[1] > self.r_dict['port_in'][1]) or \
+               (key in ['A3', 'A3d', 'B3', 'A4', 'A4d', 'B4'] and point2[0] > self.r_dict['aim'][0]-0.05):
                 # check intersection
                 if self.plates_dict[key].check_intersect(point1, point2):
                     return True, key
@@ -808,7 +1308,7 @@ class Geometry():
         # unpack angles
         alpha, beta = angles[0:2]
         # coordinates of the center of the object
-        r = r0 + calc_vector(dist, alpha, beta)
+        r = r0 + gf.calc_vector(dist, alpha, beta)
         self.r_dict[name] = r
 
     def plot(self, ax, axes='XY', plot_sep=True, plot_aim=True,
@@ -841,7 +1341,7 @@ class Geometry():
                                        linewidth=1, edgecolor='tab:gray',
                                        facecolor='tab:gray'))
 
-        index_X, index_Y = get_index(axes)
+        index_X, index_Y = gf.get_index(axes)
         # plot plates
         for name in self.plates_dict.keys():
             if name == 'an' and not plot_analyzer:
@@ -855,8 +1355,9 @@ class Geometry():
             ax.plot(self.r_dict['slit'][index_X], self.r_dict['slit'][index_Y],
                     '*', color='g')
 
-
 # %%
+
+
 def add_diafragm(geom, plts_name, diaf_name, diaf_width=0.1):
     '''
     add new plates object which works as a diafragm
@@ -869,144 +1370,16 @@ def add_diafragm(geom, plts_name, diaf_name, diaf_width=0.1):
     for i in [0, 1]:  # index for upper/lower plate
         for j in [0, 1]:
             # rotate and shift edge to initial coord system
-            coords = rotate3(geom.plates_dict[diaf_name].edges[i][j] -
-                             r0, angles, beamline_angles, inverse=True)
+            coords = gf.rotate3(geom.plates_dict[diaf_name].edges[i][j] -
+                                r0, angles, beamline_angles, inverse=True)
             # shift up for upper plate and down for lower
             coords += [0, diaf_width*(1-2*i), 0]
             geom.plates_dict[diaf_name].edges[i][3-j] = \
-                rotate3(coords, angles, beamline_angles, inverse=False) + r0
-
-
-# %%
-@numba.njit()
-def calc_vector(length, alpha, beta):
-    '''
-    calculate vector based on its length and angles
-    alpha is the angle with XZ plane
-    beta is the angle of rotation around Y axis
-    '''
-    drad = np.pi/180.  # converts degrees to radians
-    x = np.cos(alpha*drad) * np.cos(beta*drad)
-    y = np.sin(alpha*drad)
-    z = -np.cos(alpha*drad) * np.sin(beta*drad)
-    return np.array([x, y, z]) * length
-
-
-@numba.njit()
-def calc_angles(vector):
-    '''
-    calculate alpha and beta angles based on vector coords
-    '''
-    drad = np.pi/180.  # converts degrees to radians
-    x, y, z = vector / np.linalg.norm(vector)
-    # alpha = np.arcsin(y)  # rad
-    alpha = np.arccos(x)  # rad
-    if abs(y) > 1e-9:
-        beta = np.arcsin(-np.tan(alpha) * z / y)  # rad
-    elif abs(z) < 1e-9:
-        beta = 0.
-    elif abs(x) > 1e-9:
-        beta = np.arctan(-z / x)  # rad
-    else:
-        beta = -np.sign(z) * np.pi/2
-    return alpha/drad, beta/drad  # degrees
-
-
-# %% get axes index
-def get_index(axes):
-    axes_dict = {'XY': (0, 1), 'XZ': (0, 2), 'ZY': (2, 1)}
-    return axes_dict[axes]
-
-
-# %% Runge-Kutta
-# define equations of movement:
-
-@numba.njit()
-def f(k, E, V, B):
-    return k*(E + np.cross(V, B))
-
-
-@numba.njit()
-def g(V):
-    return V
-
-
-@numba.njit()
-def runge_kutt(k, RV, dt, E, B):
-    '''
-    Calculate one step using Runge-Kutta algorithm
-
-    V' = k(E + [VxB]) == K(E + np.cross(V,B)) == f
-    r' = V == g
-
-    V[n+1] = V[n] + (h/6)(m1 + 2m2 + 2m3 + m4)
-    r[n+1] = r[n] + (h/6)(k1 + 2k2 + 2k3 + k4)
-    m[1] = f(t[n], V[n], r[n])
-    k[1] = g(t[n], V[n], r[n])
-    m[2] = f(t[n] + (h/2), V[n] + (h/2)m[1], r[n] + (h/2)k[1])
-    k[2] = g(t[n] + (h/2), V[n] + (h/2)m[1], r[n] + (h/2)k[1])
-    m[3] = f(t[n] + (h/2), V[n] + (h/2)m[2], r[n] + (h/2)k[2])
-    k[3] = g(t[n] + (h/2), V[n] + (h/2)m[2], r[n] + (h/2)k[2])
-    m[4] = f(t[n] + h, V[n] + h*m[3], r[n] + h*k[3])
-    k[4] = g(t[n] + h, V[n] + h*m[3], r[n] + h*k[3])
-
-    Parameters
-    ----------
-    k : float
-        particle charge [Co] / particle mass [kg]
-    RV : np.array([[x, y, z, Vx, Vy, Vz]])
-        coordinates and velocities array [m], [m/s]
-    dt : float
-        timestep [s]
-    E : np.array([Ex, Ey, Ez])
-        values of electric field at current point [V/m]
-    B : np.array([Bx, By, Bz])
-        values of magnetic field at current point [T]
-
-    Returns
-    -------
-    RV : np.array([[x, y, z, Vx, Vy, Vz]])
-        new coordinates and velocities
-
-    '''
-    
-    if np.any(np.isnan(B)): 
-        print('NaN!!  B = ', B)
-        print('   RV = ', RV)
-    
-    if np.any(np.isnan(E)): 
-        print('NaN!!  E = ', E)
-        print('   RV = ', RV)
-    
-    r = RV[0, :3]
-    V = RV[0, 3:]
-
-    m1 = f(k, E, V, B)
-    k1 = g(V)
-
-    fV2 = V + (dt / 2.) * m1
-    gV2 = V + (dt / 2.) * m1
-    m2 = f(k, E, fV2, B)
-    k2 = g(gV2)
-
-    fV3 = V + (dt / 2.) * m2
-    gV3 = V + (dt / 2.) * m2
-    m3 = f(k, E, fV3, B)
-    k3 = g(gV3)
-
-    fV4 = V + dt * m3
-    gV4 = V + dt * m3
-    m4 = f(k, E, fV4, B)
-    k4 = g(gV4)
-
-    V = V + (dt / 6.) * (m1 + (2. * m2) + (2. * m3) + m4)
-    r = r + (dt / 6.) * (k1 + (2. * k2) + (2. * k3) + k4)
-
-    RV = np.hstack((r, V))
-    return RV
-
+                gf.rotate3(coords, angles, beamline_angles, inverse=False) + r0
 
 # %%
+
+
 def optimize_B2(tr, geom, UB2, dUB2, E, B, dt, stop_plane_n, target='aim',
                 optimize=True, eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10):
     '''
@@ -1023,13 +1396,13 @@ def optimize_B2(tr, geom, UB2, dUB2, E, B, dt, stop_plane_n, target='aim',
         # pass fan of secondaries
         tr.pass_fan(r_aim, E, B, geom, stop_plane_n=stop_plane_n,
                     eps_xy=eps_xy, eps_z=eps_z,
-                    no_intersect=True, no_out_of_bounds=True, 
-                    invisible_wall_x=geom.r_dict[target][0]+0.2)
+                    no_intersect=True, no_out_of_bounds=True,
+                    invisible_wall_x=geom.r_dict[target][0]+0.1)
         # pass trajectory to the target
-        tr.pass_to_target(r_aim, E, B, geom, stop_plane_n=stop_plane_n,
-                          eps_xy=eps_xy, eps_z=eps_z, dt_min=dt_min,
-                          no_intersect=True, no_out_of_bounds=True, 
-                          invisible_wall_x=geom.r_dict[target][0]+0.2)
+        tr._pass_to_target(r_aim, E, B, geom, stop_plane_n=stop_plane_n,  # !!!
+                           eps_xy=eps_xy, eps_z=eps_z, dt_min=dt_min,
+                           no_intersect=True, no_out_of_bounds=True,
+                           invisible_wall_x=geom.r_dict[target][0]+0.1)
         print('IsAimXY = ', tr.IsAimXY)
         print('IsAimZ = ', tr.IsAimZ)
         if True in tr.IntersectGeometry.values():
@@ -1046,14 +1419,14 @@ def optimize_B2(tr, geom, UB2, dUB2, E, B, dt, stop_plane_n, target='aim',
                 dz = r_aim[2]-tr.RV_sec[-1, 2]
                 print('UB2 OLD = {:.2f}, z_aim - z = {:.4f} m'
                       .format(UB2, dz))
-                
-                UB2_old = UB2 
+
+                UB2_old = UB2
                 UB2 = UB2 - dUB2*dz
-                if np.isnan(UB2): 
+                if np.isnan(UB2):
                     tr.print_log("dUB2 = %f" % dUB2)
                     tr.print_log("dz = %f" % dz)
                     tr.print_log("UB2_old = %f" % UB2_old)
-                    
+
                 print('UB2 NEW = {:.2f}'.format(UB2))
                 attempts_opt += 1
             else:
@@ -1067,148 +1440,159 @@ def optimize_B2(tr, geom, UB2, dUB2, E, B, dt, stop_plane_n, target='aim',
             break
     return tr
 
+# %% new prim beamline optimization
 
-# %%
-def optimize_A3B3(tr, geom, UA3, UB3, dUA3, dUB3,
-                  E, B, dt, target='slit', UA3_max=50., UB3_max=50.,
-                  eps_xy=1e-3, eps_z=1e-3):
+
+def single_shot(tr, geom, E, B, dt, stop_plane_n, target='aim', eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10):
+
+    r_aim = geom.r_dict[target]
+
+    tr.dt1, tr.dt2 = dt, dt
+    # pass fan of secondaries
+    #!!! no_intersect=True, no_out_of_bounds=True
+    tr.pass_fan(r_aim, E, B, geom, stop_plane_n=stop_plane_n, eps_xy=eps_xy, eps_z=eps_z,
+                no_intersect=False, no_out_of_bounds=False, invisible_wall_x=geom.r_dict[target][0]+0.1)
+    # pass trajectory to the target
+    tr._pass_to_target(r_aim, E, B, geom, stop_plane_n=stop_plane_n, eps_xy=eps_xy, eps_z=eps_z, dt_min=dt_min,
+                       no_intersect=False, no_out_of_bounds=False, invisible_wall_x=geom.r_dict[target][0]+0.1)
+
+    if True in tr.IntersectGeometry.values():
+        return None
+
+    # if tr.IsAimXY
+    dz = r_aim[2]-tr.RV_sec[-1, 2]  # ???
+    return dz
+
+
+def double_shot(tr, geom, UB2_pair, E, B, dt, stop_plane_n, target='aim', eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10):
+
+    _u1, _u2 = UB2_pair
+    tr.U['B2'] = _u1
+    dz1 = single_shot(tr, geom,  E, B, dt, stop_plane_n,
+                      target='aim', eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10)
+    tr.U['B2'] = _u2
+    dz2 = single_shot(tr, geom, E, B, dt, stop_plane_n,
+                      target='aim', eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10)
+
+    if dz1 is None:
+        return False, None
+    if dz2 is None:
+        return False, None
+
+    if abs(dz1 - dz2) < 0.02:
+        if abs(min(dz1, dz2)) < 0.05:
+            return True, _u1
+        else:
+            return False, None
+
+    ok = abs(min(dz1, dz2)) < 0.2
+
+    #u_prognosis = _u1 + (_u2 - _u1)*dU_dz(u1, u2, dz1, dz2)
+    u_prognosis = _u1 - dz1/(dz2 - dz1)*(_u2 - _u1)
+    return ok, u_prognosis
+
+
+def _optimize_B2(tr, geom, UB2, dUB2, E, B, dt, stop_plane_n, target='aim',
+                 optimize=True, eps_xy=1e-3, eps_z=1e-3, dt_min=1e-10):
     '''
-    get voltages on A3 and B3 plates to get into target
+    get voltages on B2 plates and choose secondary trajectory
+    which goes into target
     '''
-    print('\nEb = {}, UA2 = {}'.format(tr.Ebeam, tr.U['A2']))
+    # set up target
     print('Target: ' + target)
-    rs = geom.r_dict[target]
-    stop_plane_n = geom.plates_dict['an'].slit_plane_n
+    # r_aim = geom.r_dict[target]
 
-    tr.dt1 = dt
-    tr.dt2 = dt
-    tmax = 9e-5
-    tr.IsAimXY = False
-    tr.IsAimZ = False
-    RV0 = np.array([tr.RV_sec[0]])
+    ok, u_progn = double_shot(tr, geom, (UB2 - 4.0, UB2 + 4.0),
+                              E, B, dt, stop_plane_n, target, eps_xy, eps_z, dt_min)
 
-    vltg_fail = False  # flag to track voltage failure
-    n_stepsA3 = 0
-    while not (tr.IsAimXY and tr.IsAimZ):
-        tr.U['A3'], tr.U['B3'] = UA3, UB3
-        tr.pass_sec(RV0, rs, E, B, geom,  # stop_plane_n=stop_plane_n,
-                    tmax=tmax, eps_xy=eps_xy, eps_z=eps_z)
-
-        drXY = np.linalg.norm(rs[:2]-tr.RV_sec[-1, :2]) * \
-            np.sign(np.cross(tr.RV_sec[-1, :2], rs[:2]))
-        print('\n UA3 OLD = {:.2f} kV, dr XY = {:.4f} m'.format(UA3, drXY))
-        print('IsAimXY = ', tr.IsAimXY)
-        # if drXY < 1e-2:
-        #     dUA3 = 10.0
-
-        UA3 = UA3 + dUA3*drXY
-        print('UA3 NEW = {:.2f} kV'.format(UA3))
-        n_stepsA3 += 1
-
-        if np.isnan(UA3):
-            print('ALPHA3 failed, nan value in UA3')
-            vltg_fail = True
-            return tr, vltg_fail
-        if abs(UA3) > UA3_max:
-            print('ALPHA3 failed, voltage too high')
-            vltg_fail = True
-            return tr, vltg_fail
-        if n_stepsA3 > 100:
-            print('ALPHA3 failed, too many steps')
-            vltg_fail = True
-            return tr, vltg_fail
-
-        # dz = rs[2] - tr.RV_sec[-1, 2]
-        # print('\n UB3 OLD = {:.2f} kV, dZ = {:.4f} m'.format(UB3, dz))
-        if abs(drXY) < 0.01:
-            if tr.IntersectGeometrySec['A3']:
-                print('BAD A3!')
-                vltg_fail = True
-                return tr, vltg_fail
-            n_stepsZ = 0
-            while not tr.IsAimZ:
-                print('pushing Z direction')
-                tr.U['A3'], tr.U['B3'] = UA3, UB3
-                tr.pass_sec(RV0, rs, E, B, geom,  # stop_plane_n=stop_plane_n,
-                            tmax=tmax, eps_xy=eps_xy, eps_z=eps_z)
-                # tr.IsAimZ = True  # if you want to skip UB3 calculation
-                dz = rs[2] - tr.RV_sec[-1, 2]
-                print(' UB3 OLD = {:.2f} kV, dZ = {:.4f} m'
-                      .format(UB3, dz))
-                print('IsAimXY = ', tr.IsAimXY)
-                print('IsAimZ = ', tr.IsAimZ)
-
-                UB3 = UB3 - dUB3*dz
-                n_stepsZ += 1
-                if abs(UB3) > UB3_max:
-                    print('BETA3 failed, voltage too high')
-                    vltg_fail = True
-                    return tr, vltg_fail
-                if n_stepsZ > 100:
-                    print('BETA3 failed, too many steps')
-                    vltg_fail = True
-                    return tr, vltg_fail
-                # print('UB3 NEW = {:.2f} kV'.format(UB3))
-            n_stepsA3 = 0
-            print('n_stepsZ = ', n_stepsZ)
-            dz = rs[2] - tr.RV_sec[-1, 2]
-            print('UB3 NEW = {:.2f} kV, dZ = {:.4f} m'.format(UB3, dz))
-
-    return tr, vltg_fail
-
-
-# %%
-def optimize_A4(tr, geom, UA4, dUA4, E, B, dt, eps_alpha=0.1):
-    '''
-    get voltages on A4 to get proper alpha angle at the entrance to analyzer
-    '''
-    print('\n A4 optimization')
-    print('\nEb = {}, UA2 = {}'.format(tr.Ebeam, tr.U['A2']))
-
-    rs = geom.r_dict['slit']
-    stop_plane_n = geom.plates_dict['an'].slit_plane_n
-    alpha_target = geom.angles_dict['an'][0]
-
-    tr.dt1 = dt
-    tr.dt2 = dt
-    tmax = 9e-5
-    # tr.IsAimXY = False
-    # tr.IsAimZ = False
-    RV0 = np.array([tr.RV_sec[0]])
-    V_last = tr.RV_sec[-1][3:]
-    alpha, beta = calc_angles(V_last)
-    dalpha = alpha_target - alpha
-    n_stepsA4 = 0
-    while (abs(alpha - alpha_target) > eps_alpha):
-        tr.U['A4'] = UA4
-        tr.pass_sec(RV0, rs, E, B, geom,  # stop_plane_n=stop_plane_n,
-                    tmax=tmax, eps_xy=1e-2, eps_z=1e-2)
-
-        V_last = tr.RV_sec[-1][3:]
-        alpha, beta = calc_angles(V_last)
-        dalpha = alpha_target - alpha
-        print('\n UA4 OLD = {:.2f} kV, dalpha = {:.4f} deg'
-              .format(UA4, dalpha))
-        drXY = np.linalg.norm(rs[:2]-tr.RV_sec[-1, :2]) * \
-            np.sign(np.cross(tr.RV_sec[-1, :2], rs[:2]))
-        dz = rs[2] - tr.RV_sec[-1, 2]
-        print('dr XY = {:.4f} m, dz = {:.4f} m'.format(drXY, dz))
-
-        UA4 = UA4 + dUA4*dalpha
-        print('UA4 NEW = {:.2f} kV'.format(UA4))
-        n_stepsA4 += 1
-
-        if abs(UA4) > 50.:
-            print('ALPHA4 failed, voltage too high')
+    if ok:
+        tr.U['B2'] = u_progn
+        single_shot(tr, geom, E, B, dt, stop_plane_n,
+                    target, eps_xy, eps_z, dt_min)
+        return tr
+    else:
+        if u_progn is not None:
+            ok, u_progn = double_shot(tr, geom, (u_progn - 4.0, u_progn + 4.0),
+                                      E, B, dt, stop_plane_n, target, eps_xy, eps_z, dt_min)
+            tr.U['B2'] = u_progn if u_progn is not None else UB2
+            single_shot(tr, geom, E, B, dt, stop_plane_n,
+                        target, eps_xy, eps_z, dt_min)
             return tr
-        if n_stepsA4 > 100:
-            print('ALPHA4 failed, too many steps')
+        else:
+            # Brute force
+            print('      !!! ----------------- u_progn is None --------------- !!!  ')
+            u1, u2 = UB2 - 14.0, UB2 + 14.0
+            ok1, u_progn1 = double_shot(
+                tr, geom, (u1 - 4.0, u1 + 4.0), E, B, dt, stop_plane_n, target, eps_xy, eps_z, dt_min)
+            ok2, u_progn2 = double_shot(
+                tr, geom, (u2 - 4.0, u2 + 4.0), E, B, dt, stop_plane_n, target, eps_xy, eps_z, dt_min)
+
+            tr.U['B2'] = u_progn1 if u_progn1 is not None else UB2
+            dz1 = single_shot(tr, geom, E, B, dt, stop_plane_n,
+                              target, eps_xy, eps_z, dt_min)
+
+            tr.U['B2'] = u_progn2 if u_progn is not None else UB2
+            dz2 = single_shot(tr, geom, E, B, dt, stop_plane_n,
+                              target, eps_xy, eps_z, dt_min)
+
+            if dz1 is None:
+                return tr
+
+            if (dz2 is None) or np.abs(dz1) < np.abs(dz2):
+                tr.U['B2'] = u_progn1 if u_progn1 is not None else UB2
+                dz1 = single_shot(tr, geom, E, B, dt,
+                                  stop_plane_n, target, eps_xy, eps_z, dt_min)
             return tr
 
+    '''
+    #Old parts
+    attempts_opt, attempts_fan = 0, 0
+    dz, prev_dz = None, None
+    ustep, prev_ustep = None, None
+
+    while True:
+
+        tr.U['B2'] = UB2
+        tr.dt1, tr.dt2 = dt, dt
+        # pass fan of secondaries
+        tr.pass_fan       (r_aim, E, B, geom, stop_plane_n=stop_plane_n, eps_xy=eps_xy, eps_z=eps_z,                no_intersect=True, no_out_of_bounds=True, invisible_wall_x=geom.r_dict[target][0]+0.1)
+        # pass trajectory to the target
+        tr._pass_to_target(r_aim, E, B, geom, stop_plane_n=stop_plane_n, eps_xy=eps_xy, eps_z=eps_z, dt_min=dt_min, no_intersect=True, no_out_of_bounds=True, invisible_wall_x=geom.r_dict[target][0]+0.1)
+        
+        print('IsAimXY = ', tr.IsAimXY); print('IsAimZ = ', tr.IsAimZ)
+        if True in tr.IntersectGeometry.values():
+            break
+        if not tr.fan_ok:
+            attempts_fan += 1
+        if attempts_fan > 3 or len(tr.Fan) == 0:
+            print('Fan of secondaries is not ok')
+            break
+
+        # change UB2 value proportional to dz
+        if not tr.IsAimZ:
+            prev_dz, dz = dz, r_aim[2]-tr.RV_sec[-1, 2]
+            if (prev_dz is not None)and(prev_ustep is not None): 
+                print('before    dz=', dz, '   ustep=', ustep, '   prev_ustep=', prev_ustep, '    prev_dz=', prev_dz)
+                prev_ustep, ustep = ustep, prev_ustep*dz/(dz - prev_dz)
+                print('after    dz=', dz, '   ustep=', ustep, '   prev_ustep=', prev_ustep, '    prev_dz=', prev_dz)
+            else:     
+                print('before    dz=', dz, '   ustep=', ustep, '   prev_ustep=', prev_ustep, '    prev_dz=', prev_dz)
+                prev_ustep, ustep = ustep, - dUB2*dz
+                print('after    dz=', dz, '   ustep=', ustep, '   prev_ustep=', prev_ustep, '    prev_dz=', prev_dz)
+             
+            UB2 = UB2 + ustep
+            attempts_opt += 1
+
+        else:
+            break
+        
+        if attempts_opt > 20:  # check if there is a loop while finding secondary to aim
+            print('too many attempts B2!')
+            break
     return tr
-
-
-# %%
+    '''
+    
+#%%
 def calc_zones(tr, dt, E, B, geom, slits=[2], timestep_divider=5,
                stop_plane_n=np.array([1., 0., 0.]), eps_xy=1e-3, eps_z=1,
                dt_min=1e-11, no_intersect=True, no_out_of_bounds=True):
@@ -1255,27 +1639,22 @@ def calc_zones(tr, dt, E, B, geom, slits=[2], timestep_divider=5,
         tr.pass_sec(RV_new, r_aim, E, B, geom,
                     stop_plane_n=slit_plane_n,
                     tmax=9e-5, eps_xy=1e-3, eps_z=1)
+
         # make a step on primary trajectory
         r = RV_old[0, :3]
-        # try:
-        #     B_local = return_B(r, B)
-        #     # if np.isnan(B_local).any(): 
-        #     #     tr.print_log('Btor is nan, r = %s' % str(r))
-        #     #     break
-        #     if np.isnan(B_local[0, 0]): break
-        # except ValueError:
-        #     print('B out of bounds while calculating zones')
-        #     break
-        #!!!
-        B_local = return_B_new(r, B)
-        if np.isnan(B_local).any():
-            print('Btor is nan, r = %s' % str(r))
-            break
-                
+
+        # fields
         E_local = np.array([0., 0., 0.])
+        B_local = B(r)
+        if np.isnan(B_local).any():
+            # print('Btor is nan, r = %s' % str(r))
+            break
+
+        # runge-kutta step
         RV_new = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
         RV_old = RV_new
         i_steps += 1
+
         # check intersection with slits polygon
         intersect_coords_flat = np.delete(tr.RV_sec[-1, :3], ax_index, 0)
         contains_point = slits_spot_poly.contains_point(intersect_coords_flat)
@@ -1299,8 +1678,8 @@ def calc_zones(tr, dt, E, B, geom, slits=[2], timestep_divider=5,
             for i_tr in range(len(tr.Fan) - 1):
                 p1, p2 = tr.Fan[i_tr][-1, :3], tr.Fan[i_tr+1][-1, :3]
                 # check intersection between fan segment and slit edge
-                if is_intersect(p1, p2, edge[0], edge[1]):
-                    r_intersect = segm_intersect(p1, p2, edge[0], edge[1])
+                if gf.is_intersect(p1, p2, edge[0], edge[1]):
+                    r_intersect = gf.segm_intersect(p1, p2, edge[0], edge[1])
                     print('\n intersection with slit ' + str(i_slit))
                     print(r_intersect)
                     tr.dt1 = dt/timestep_divider
@@ -1320,9 +1699,10 @@ def calc_zones(tr, dt, E, B, geom, slits=[2], timestep_divider=5,
     return tr
 
 
-# %%
+#%%
 def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
-                   slits=range(5), no_intersect=True, no_out_of_bounds=True):
+                  slits=range(7), no_intersect=True, no_out_of_bounds=True,
+                  print_log=True):
     '''
     pass trajectories to slits and save secondaries which get into slits
     '''
@@ -1353,8 +1733,9 @@ def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
     index = np.nanargmin(np.linalg.norm(tr.RV_prim[:, :3] -
                                         tr.RV_sec[0, :3], axis=1))
     sec_ind = range(index-2, index+2)
-
-    print('\nStarting precise fan calculation')
+    
+    if print_log:
+        print('\nStarting precise fan calculation')
     # divide the timestep
     tr.dt1 = dt/timestep_divider
     tr.dt2 = dt
@@ -1364,6 +1745,7 @@ def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
     fan_list = []
     # take the point to start fan calculation
     # RV_old = tr.Fan[sec_ind[0]-1][0]
+    # RV_old = tr.RV_prim[sec_ind[0]]
     RV_old = tr.RV_prim[sec_ind[0]]
     RV_old = np.array([RV_old])
     RV_new = RV_old
@@ -1374,52 +1756,57 @@ def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
         # pass new secondary trajectory
         tr.pass_sec(RV_new, rs, E, B, geom,
                     stop_plane_n=slit_plane_n, tmax=9e-5,
-                    eps_xy=1e-3, eps_z=1)
+                    eps_xy=1e-3, eps_z=1, print_log=False)
+
         # make a step on primary trajectory
         r = RV_old[0, :3]
-        # try: 
-        #     B_local = return_B(r, B)
-        #     # if np.isnan(B_local).any(): 
-        #     #     tr.print_log('Btor is nan, r = %s' % str(r))
-        #     #     break
-        #     if np.isnan(B_local[0, 0]): break
-        # except ValueError:
-        #     print('B out of bounds while passing to slits')
-        #     break
-        #!!!
-        B_local = return_B_new(r, B)
-        if np.isnan(B_local).any():
-            print('Btor is nan, r = %s' % str(r))
-            break
+
+        # fields
         E_local = np.array([0., 0., 0.])
+        B_local = B(r)
+        if np.isnan(B_local).any():
+            if print_log:
+                print('Btor is nan, r = %s' % str(r))
+            break
+
+        # runge-kutta step
         RV_new = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
         RV_old = RV_new
         i_steps += 1
+
+        # check intersection with slits polygon
         intersect_coords_flat = np.delete(tr.RV_sec[-1, :3], ax_index, 0)
         contains_point = slits_spot_poly.contains_point(intersect_coords_flat)
+
+        # save result
         if not (True in tr.IntersectGeometrySec.values() or
                 tr.B_out_of_bounds) and contains_point:
             inside_slits_poly = True
             fan_list.append(tr.RV_sec)
         if not contains_point and inside_slits_poly:
             break
-    print('\nPrecise fan calculated')
+    if print_log:
+        print('\nPrecise fan calculated')
 
     # choose secondaries which get into slits
     # start slit cycle
     for i_slit in slits:
-        print('\nslit = {}'.format(i_slit+1))
-        print('center of the slit = ', r_slits[i_slit, 0, :], '\n')
+        if print_log:
+            print('\nslit = {}'.format(i_slit+1))
+            print('center of the slit = ', r_slits[i_slit, 0, :], '\n')
+
         # create slit polygon
         slit_flat = np.delete(r_slits[i_slit, 1:, :], ax_index, 1)
         slit_poly = path.Path(slit_flat)
         zones_list = []  # list for ion zones coordinates
         rv_list = []  # list for RV arrays of secondaries
+
         for fan_tr in fan_list:
             # get last coordinates of the secondary trajectory
             intersect_coords_flat = np.delete(fan_tr[-1, :3], ax_index, 0)
             if slit_poly.contains_point(intersect_coords_flat):
-                print('slit {} ok!\n'.format(i_slit+1))
+                if print_log:
+                    print('slit {} ok!\n'.format(i_slit+1))
                 rv_list.append(fan_tr)
                 zones_list.append(fan_tr[0, :3])
 
@@ -1429,369 +1816,19 @@ def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
 
     return tr
 
-
-# %%
-@numba.njit()
-def translate(input_array, xyz):
+#%% fatbeam trajectoies saving functions
+def save_traj_list_fb(traj_list, Ebeam, UA2, dirname):
     '''
-    move the vector in space
-    xyz : 3 component vector
+    save list of Traj objects to *.pkl file
     '''
-    if input_array is not None:
-        input_array += np.array(xyz)
-
-    return input_array
-
-
-@numba.njit()
-def rot_mx(axis=(1, 0, 0), deg=0):
-    '''
-    function calculates rotation matrix
-    '''
-    n = axis
-    ca = np.cos(np.radians(deg))
-    sa = np.sin(np.radians(deg))
-    R = np.array([[n[0]**2*(1-ca)+ca, n[0]*n[1]*(1-ca)-n[2]*sa,
-                   n[0]*n[2]*(1-ca)+n[1]*sa],
-
-                  [n[1]*n[0]*(1-ca)+n[2]*sa, n[1]**2*(1-ca)+ca,
-                   n[1]*n[2]*(1-ca)-n[0]*sa],
-
-                  [n[2]*n[0]*(1-ca)-n[1]*sa, n[2]*n[1]*(1-ca)+n[0]*sa,
-                   n[2]**2*(1-ca)+ca]])
-    return R
-
-
-@numba.njit()
-def rotate(input_array, axis=(1, 0, 0), deg=0.):
-    '''
-    rotate vector around given axis by deg [degrees]
-    axis : axis of rotation
-    deg : angle in degrees
-    '''
-    if input_array is not None:
-        R = rot_mx(axis, deg)
-        input_array = np.dot(input_array, R.T)
-    return input_array
-
-
-@numba.njit()
-def rotate3(input_array, plates_angles, beamline_angles, inverse=False):
-    '''
-    rotate vector in 3 dimentions
-    plates_angles : angles of the plates
-    beamline_angles : angles of the beamline axis, rotation on gamma angle
-    '''
-    alpha, beta, gamma = plates_angles
-    axis = calc_vector(1, beamline_angles[0], beamline_angles[1])
-
-    if inverse:
-        rotated_array = rotate(input_array, axis=axis, deg=-gamma)
-        rotated_array = rotate(rotated_array, axis=(0, 1, 0), deg=-beta)
-        rotated_array = rotate(rotated_array, axis=(0, 0, 1), deg=-alpha)
-    else:
-        rotated_array = rotate(input_array, axis=(0, 0, 1), deg=alpha)
-        rotated_array = rotate(rotated_array, axis=(0, 1, 0), deg=beta)
-        rotated_array = rotate(rotated_array, axis=axis, deg=gamma)
-    return rotated_array
-
-
-# %% Intersection check functions
-@numba.njit()
-def line_plane_intersect(planeNormal, planePoint, rayDirection,
-                         rayPoint, eps=1e-6):
-    '''
-    function returns intersection point between plane and ray
-    '''
-    ndotu = np.dot(planeNormal, rayDirection)
-    if abs(ndotu) < eps:
-        # print('no intersection or line is within plane')
-        return np.full_like(planeNormal, np.nan)
-    else:
-        w = rayPoint - planePoint
-        si = -np.dot(planeNormal, w) / ndotu
-        Psi = w + si * rayDirection + planePoint
-        return Psi
-
-
-@numba.njit()
-def is_between(A, B, C, eps=1e-6):
-    '''
-    function returns True if point C is on the segment AB (between A and B)
-    '''
-    if np.isnan(C).any():
-        return False
-    # check if the points are on the same line
-    crossprod = np.cross(B-A, C-A)
-    if np.linalg.norm(crossprod) > eps:
-        return False
-    # check if the point is between
-    dotprod = np.dot(B-A, C-A)
-    if dotprod < 0 or dotprod > np.linalg.norm(B-A)**2:
-        return False
-    return True
-
-
-@numba.njit()
-def order(A, B, C):
-    '''
-    if counterclockwise return True
-    if clockwise return False
-    '''
-    return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-
-
-@numba.njit()
-def is_intersect(A, B, C, D):  # doesn't work with collinear case
-    '''
-    function returns true if line segments AB and CD intersect
-    '''
-    # Return true if line segments AB and CD intersect
-    return order(A, C, D) != order(B, C, D) and \
-        order(A, B, C) != order(A, B, D)
-
-
-@numba.njit()
-def segm_intersect(A, B, C, D):
-    '''
-    function calculates intersection point between vectors AB and CD
-    in case AB and CD intersect
-    '''
-    # define vectors
-    AB, CA, CD = B - A, A - C, D - C
-    return A + AB * (np.cross(CD, CA) / np.cross(AB, CD))
-
-
-@numba.njit()
-def segm_poly_intersect(polygon_coords, segment_coords):
-    '''
-    check segment and polygon intersection
-    '''
-    polygon_normal = np.cross(polygon_coords[2, 0:3]-polygon_coords[0, 0:3],
-                              polygon_coords[1, 0:3]-polygon_coords[0, 0:3])
-    polygon_normal = polygon_normal/np.linalg.norm(polygon_normal)
-    # find the intersection point between polygon plane and segment line
-    intersect_coords = line_plane_intersect(polygon_normal,
-                                            polygon_coords[2, 0:3],
-                                            segment_coords[1, 0:3] -
-                                            segment_coords[0, 0:3],
-                                            segment_coords[0, 0:3])
-    if np.isnan(intersect_coords).any():
-        return False
-    if not is_between(segment_coords[0, 0:3], segment_coords[1, 0:3],
-                      intersect_coords):
-        return False
-    # go to 2D, exclude the maximum coordinate
-    i = np.argmax(np.abs(polygon_normal))
-    inds = np.array([0, 1, 2])  # indexes for 3d corrds
-    inds_flat = np.where(inds != i)[0]
-    polygon_coords_flat = polygon_coords[:, inds_flat]
-    intersect_coords_flat = intersect_coords[inds_flat]
-    # define a rectange which contains the flat poly
-    xmin = np.min(polygon_coords_flat[:, 0])
-    xmax = np.max(polygon_coords_flat[:, 0])
-    ymin = np.min(polygon_coords_flat[:, 1])
-    ymax = np.max(polygon_coords_flat[:, 1])
-    xi, yi = intersect_coords_flat
-    # simple check if a point is inside a rectangle
-    if (xi < xmin or xi > xmax or yi < ymin or yi > ymax):
-        return False
-    # ray casting algorithm
-    # set up a point outside the flat poly
-    point_out = np.array([xmin - 0.01, ymin - 0.01])
-    # calculate the number of intersections between ray and the poly sides
-    intersections = 0
-    for i in range(polygon_coords_flat.shape[0]):
-        if is_intersect(point_out, intersect_coords_flat,
-                        polygon_coords_flat[i-1], polygon_coords_flat[i]):
-            intersections += 1
-    # if the number of intersections is odd then the point is inside
-    if intersections % 2 == 0:
-        return False
-    else:
-        return True
-
-    # p = path.Path(polygon_coords_flat)
-    # return p.contains_point(intersect_coords_flat)
-
-    # check projections on XY and XZ planes
-    # pXY = path.Path(polygon_coords[:, [0, 1]])  # XY plane
-    # pXZ = path.Path(polygon_coords[:, [0, 2]])  # XZ plane
-    # return pXY.contains_point(intersect_coords[[0, 1]]) and \
-    #     pXZ.contains_point(intersect_coords[[0, 2]]) and \
-    #         is_between(segment_coords[0, 0:3], segment_coords[1, 0:3],
-    #                   intersect_coords)
-
-
-# %%
-def plate_flags(range_x, range_y, range_z, U,
-                plts_geom, plts_angles, plts_center):
-    '''
-    calculate plates cooedinates and boolean arrays for plates
-    '''
-    length, width, thick, gap, l_sw = plts_geom
-    gamma, alpha_sw = plts_angles
-    r_sweep_up = np.array([-length/2 + l_sw, gap/2., 0])
-    r_sweep_lp = np.array([-length/2 + l_sw, -gap/2., 0])
-    # Geometry in system based on central point between plates
-    # upper plate
-    UP1 = np.array([-length/2., gap/2. + thick, width/2.])
-    UP2 = np.array([-length/2., gap/2. + thick, -width/2.])
-    UP1sw = np.array([-length/2. + l_sw, gap/2. + thick, width/2.])
-    UP2sw = np.array([-length/2. + l_sw, gap/2. + thick, -width/2.])
-    UP3 = np.array([length/2., gap/2. + thick, -width/2.])
-    UP4 = np.array([length/2., gap/2. + thick, width/2.])
-    UP5 = np.array([-length/2., gap/2., width/2.])
-    UP6 = np.array([-length/2., gap/2., -width/2.])
-    UP5sw = np.array([-length/2. + l_sw, gap/2., width/2.])
-    UP6sw = np.array([-length/2. + l_sw, gap/2., -width/2.])
-    UP7 = np.array([length/2., gap/2., -width/2.])
-    UP8 = np.array([length/2., gap/2., width/2.])
-    if abs(alpha_sw) > 1e-2:
-        UP1 = UP1sw + rotate(UP1 - UP1sw, axis=(0, 0, 1), deg=-alpha_sw)
-        UP2 = UP2sw + rotate(UP2 - UP2sw, axis=(0, 0, 1), deg=-alpha_sw)
-        UP5 = UP5sw + rotate(UP5 - UP5sw, axis=(0, 0, 1), deg=-alpha_sw)
-        UP6 = UP6sw + rotate(UP6 - UP6sw, axis=(0, 0, 1), deg=-alpha_sw)
-        # points are sorted clockwise
-        UP_full = np.array([UP1sw, UP1, UP2, UP2sw, UP3, UP4,
-                            UP5sw, UP5, UP6, UP6sw, UP7, UP8])
-    else:
-        UP_full = np.array([UP1, UP2, UP3, UP4, UP5, UP6, UP7, UP8])
-    UP_rotated = UP_full.copy()
-    for i in range(UP_full.shape[0]):
-        UP_rotated[i, :] = rotate(UP_rotated[i, :], axis=(1, 0, 0), deg=gamma)
-        # shift coords center
-        UP_rotated[i, :] += plts_center
-
-    # lower plate
-    LP1 = np.array([-length/2., -gap/2. - thick, width/2.])
-    LP2 = np.array([-length/2., -gap/2. - thick, -width/2.])
-    LP1sw = np.array([-length/2. + l_sw, -gap/2. - thick, width/2.])
-    LP2sw = np.array([-length/2. + l_sw, -gap/2. - thick, -width/2.])
-    LP3 = np.array([length/2., -gap/2. - thick, -width/2.])
-    LP4 = np.array([length/2., -gap/2. - thick, width/2.])
-    LP5 = np.array([-length/2., -gap/2., width/2.])
-    LP6 = np.array([-length/2., -gap/2., -width/2.])
-    LP5sw = np.array([-length/2. + l_sw, -gap/2., width/2.])
-    LP6sw = np.array([-length/2. + l_sw, -gap/2., -width/2.])
-    LP7 = np.array([length/2., -gap/2., -width/2.])
-    LP8 = np.array([length/2., -gap/2., width/2.])
-    if abs(alpha_sw) > 1e-2:
-        LP1 = LP1sw + rotate(LP1 - LP1sw, axis=(0, 0, 1), deg=alpha_sw)
-        LP2 = LP2sw + rotate(LP2 - LP2sw, axis=(0, 0, 1), deg=alpha_sw)
-        LP5 = LP5sw + rotate(LP5 - LP5sw, axis=(0, 0, 1), deg=alpha_sw)
-        LP6 = LP6sw + rotate(LP6 - LP6sw, axis=(0, 0, 1), deg=alpha_sw)
-        # points are sorted clockwise
-        LP_full = np.array([LP1sw, LP1, LP2, LP2sw, LP3, LP4,
-                            LP5sw, LP5, LP6, LP6sw, LP7, LP8])
-    else:
-        LP_full = np.array([LP1, LP2, LP3, LP4, LP5, LP6, LP7, LP8])
-    LP_rotated = LP_full.copy()
-    for i in range(LP_full.shape[0]):
-        LP_rotated[i, :] = rotate(LP_rotated[i, :], axis=(1, 0, 0), deg=gamma)
-        # shift coords center
-        LP_rotated[i, :] += plts_center
-
-    # Find coords of 'cubes' containing each plate
-    upper_cube = np.array([np.min(UP_rotated, axis=0),
-                           np.max(UP_rotated, axis=0)])
-    lower_cube = np.array([np.min(LP_rotated, axis=0),
-                           np.max(LP_rotated, axis=0)])
-
-    # create mask for plates
-    upper_plate_flag = np.full_like(U, False, dtype=bool)
-    lower_plate_flag = np.full_like(U, False, dtype=bool)
-    for i in range(range_x.shape[0]):
-        for j in range(range_y.shape[0]):
-            for k in range(range_z.shape[0]):
-                x = range_x[i]
-                y = range_y[j]
-                z = range_z[k]
-                # check upper cube
-                if (x >= upper_cube[0, 0]) and (x <= upper_cube[1, 0]) and \
-                   (y >= upper_cube[0, 1]) and (y <= upper_cube[1, 1]) and \
-                   (z >= upper_cube[0, 2]) and (z <= upper_cube[1, 2]):
-                    r = np.array([x, y, z]) - plts_center
-                    # inverse rotation
-                    r_rot = rotate(r, axis=(1, 0, 0), deg=-gamma)
-                    if r_rot[0] <= -length/2 + l_sw:
-                        r_rot = r_sweep_up + rotate(r_rot - r_sweep_up,
-                                                 axis=(0, 0, 1), deg=alpha_sw)
-                    # define masks for upper and lower plates
-                    upper_plate_flag[i, j, k] = (r_rot[0] >= -length/2.) and \
-                        (r_rot[0] <= length/2.) and (r_rot[2] >= -width/2.) and \
-                        (r_rot[2] <= width/2.) and (r_rot[1] >= gap/2.) and \
-                        (r_rot[1] <= gap/2. + thick)
-                # check lower cube
-                if (x >= lower_cube[0, 0]) and (x <= lower_cube[1, 0]) and \
-                   (y >= lower_cube[0, 1]) and (y <= lower_cube[1, 1]) and \
-                   (z >= lower_cube[0, 2]) and (z <= lower_cube[1, 2]):
-                    r = np.array([x, y, z]) - plts_center
-                    # inverse rotation
-                    r_rot = rotate(r, axis=(1, 0, 0), deg=-gamma)
-                    if r_rot[0] <= -length/2 + l_sw:
-                        r_rot = r_sweep_lp + rotate(r_rot - r_sweep_lp,
-                                                 axis=(0, 0, 1), deg=-alpha_sw)
-                    # define masks for upper and lower plates
-                    lower_plate_flag[i, j, k] = (r_rot[0] >= -length/2.) and \
-                        (r_rot[0] <= length/2.) and (r_rot[2] >= -width/2.) and \
-                        (r_rot[2] <= width/2.) and \
-                        (r_rot[1] >= -gap/2. - thick) and \
-                        (r_rot[1] <= -gap/2.)
-
-    return UP_rotated, LP_rotated, upper_plate_flag, lower_plate_flag
-
-
-def return_E(r, Ein, U, geom):
-    '''
-    take dot and try to interpolate electiric field
-    Ein : dict of interpolants for Ex, Ey, Ez
-    U : dict with plates voltage values
-    '''
-    Etotal = np.zeros(3)
-    # do not check plates while particle is in plasma
-    if r[0] < geom.r_dict['aim'][0]-0.05 and r[1] < geom.r_dict['port_in'][1]:
-        return Etotal
-    # go through all the plates
-    for key in Ein.keys():
-        # shift the center of coord system
-        r_new = r - geom.r_dict[key]
-        # get angles
-        angles = copy.deepcopy(geom.plates_dict[key].angles)
-        beamline_angles = copy.deepcopy(geom.plates_dict[key].beamline_angles)
-        # rotate point to the coord system of plates
-        r_new = rotate3(r_new, angles, beamline_angles, inverse=True)
-        # interpolate Electric field
-        Etemp = np.zeros(3)
-        try:
-            Etemp[0] = Ein[key][0](r_new) * U[key]
-            Etemp[1] = Ein[key][1](r_new) * U[key]
-            Etemp[2] = Ein[key][2](r_new) * U[key]
-            # rotate Etemp
-            Etemp = rotate3(Etemp, angles, beamline_angles, inverse=False)
-            # add the result to total E field
-            Etotal += Etemp
-        except (ValueError, IndexError):
-            continue
-    return Etotal
-
-def return_B(r, Bin):
-    '''
-    interpolate Magnetic field at point r
-    '''
-    Bx_interp, By_interp, Bz_interp = Bin[0], Bin[1], Bin[2]
-    Bout = np.c_[Bx_interp(r), By_interp(r), Bz_interp(r)]
-    return Bout
-    #return np.c_[Bin[0](r), Bin[1](r), Bin[2](r)]
-
-
-def save_E(beamline, plts_name, Ex, Ey, Ez, plts_angles, plts_geom,
-           domain, an_params, plate1, plate2, dirname='elecfield'):
-    '''
-    save Ex, Ey, Ez arrays to file
-    '''
-    dirname = dirname + '/' + beamline
-
+    if len(traj_list) == 0:
+        print('traj_list empty! nothing to save')
+        return
+    Ebeam_list = []
+    UA2_list = []
+    for traj in traj_list:
+        Ebeam_list.append(traj.Ebeam)
+        UA2_list.append(traj.U['A2'])
     if not os.path.exists(dirname):
         try:
             os.makedirs(dirname, 0o700)
@@ -1799,266 +1836,466 @@ def save_E(beamline, plts_name, Ex, Ey, Ez, plts_angles, plts_geom,
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-
-    fname = plts_name + '_geometry.dat'
-    # erases data from file before writing
-    open(dirname + '/' + fname, 'w').close()
-    with open(dirname + '/' + fname, 'w') as myfile:
-        myfile.write(np.array2string(plts_geom)[1:-1] +
-                     ' # plate\'s length, width, thic, gap and l_sweeped\n')
-        myfile.write(np.array2string(plts_angles)[1:-1] +
-                     ' # plate\'s gamma and alpha_sweep angles\n')
-        myfile.write(np.array2string(domain, max_line_width=200)[1:-1] +
-                     ' # xmin, xmax, ymin, ymax, zmin, zmax, delta\n')
-        if plts_name == 'an':
-            myfile.write(np.array2string(an_params, max_line_width=200)[1:-1] +
-                         ' # n_slits, slit_dist, slit_w, G, theta, XD, YD1, YD2\n')
-        for i in range(plate1.shape[0]):
-            myfile.write(np.array2string(plate1[i], precision=4)[1:-1] +
-                         ' # 1st plate rotated\n')
-        for i in range(plate2.shape[0]):
-            myfile.write(np.array2string(plate2[i], precision=4)[1:-1] +
-                         ' # 2nd plate rotated\n')
-
-    np.save(dirname + '/' + plts_name + '_Ex', Ex)
-    np.save(dirname + '/' + plts_name + '_Ey', Ey)
-    np.save(dirname + '/' + plts_name + '_Ez', Ez)
-
-    print('Electric field saved, ' + plts_name + '\n')
-
-
-def read_plates(beamline, geom, E, dirname='elecfield'):
+    fname = os.path.join(dirname, f'fb_E{Ebeam}_U{UA2}.pkl')
+    with open(fname, 'wb') as f:
+        pc.dump(traj_list, f, -1)
+    print(f'\nSAVED LIST: \"{fname}\"\n')
+    
+    
+def read_traj_list_fb(Ebeam, UA2, dirname):
     '''
-    read Electric field and plates geometry
+    import list of Traj objects from *.pkl file
     '''
-    dirname = dirname + '/' + beamline
+    fname = os.path.join(dirname, f'fb_E{Ebeam}_U{UA2}.pkl')
+    print(f'\nLOADED: \"{fname}\"\n')
+    with open(fname, 'rb') as f:
+        traj_list = pc.load(f)
+    return traj_list
 
-    # list of all *.dat files
-    file_list = [file for file in os.listdir(dirname) if file.endswith('dat')]
-    # push analyzer to the end of the list
-    file_list.sort(key=lambda s: s[1:])  # A3, B3, A4, an
-    # file_list.sort(key=lambda s: s.startswith('an'))
+#%% fatbeam new main calc function
 
-    for filename in file_list:
-        plts_name = filename[0:2]
-        print('\n Reading geometry {} ...'.format(plts_name))
-        r_new = geom.r_dict[plts_name]
-        print('position ', r_new)
-        # angles of plates, will be modified later
-        plts_angles = copy.deepcopy(geom.angles_dict[plts_name])
-        # beamline angles
-        beamline_angles = copy.deepcopy(geom.angles_dict[plts_name])
-        # read plates parameters from file
-        edges_list = []
-        with open(dirname + '/' + filename, 'r') as f:
-            # read plates geometry, first remove comments '#', then convert to float
-            plts_geom = [float(i) for i in f.readline().split('#')[0].split()]
-            # read gamma angle (0 for Alpha and 90 for Beta plates)
-            gamma = float(f.readline().split()[0])
-            # xmin, xmax, ymin, ymax, zmin, zmax, delta
-            domain = [float(i) for i in f.readline().split()[0:7]]
-            if plts_name == 'an':
-                an_params = [float(i) for i in f.readline().split()[0:8]]
-                theta_an = an_params[4]  # analyzer entrance angle
-                plts_angles[0] = plts_angles[0] - theta_an
-            for line in f:
-                # read plates Upper and Lowe plate coords, x,y,z
-                edges_list.append([float(i) for i in line.split()[0:3]])
-        edges_list = np.array(edges_list)
+# function to pass to joblib Parallel routine
+def fatbeam_calc_core(tr_fat, dt, E, B, geomT15, target='slit',
+                          slits=range(7), timestep_divider=10,
+                          tmax=1e-5, invisible_wall_x=5.5, print_log=False):
+        tr_fat.pass_prim(E, B, geomT15, tmax=tmax,
+                      invisible_wall_x=invisible_wall_x, print_log=print_log)
+        tr_fat = pass_to_slits(tr_fat, dt, E, B, geomT15, target=target,
+                                  slits=slits, timestep_divider=timestep_divider, print_log=print_log)
+        
+        return tr_fat
 
-        if plts_name == 'an':
-            # create new Analyzer object
-            plts = Analyzer(plts_name, beamline)
-            plts.add_slits(an_params)
+def fatbeam_E_UA2_selector(tr, Ebeam_orig, UA2_orig):
+    """
+    
+    Function takes one trajectory, Ebeam and UA2 parameters.
+    
+    Parameters
+    ----------
+    tr : Traj Class
+        One optimized trajectory.
+    Ebeam_orig : float or str
+        Beam energy [keV] or 'all'.
+        'all' - wil calc for all Ebeam values from traj_list.
+    UA2_orig : float or str
+        A2 plate voltage [kV] or 'all'.
+        'all' - wil calc for all UA2 values from traj_list.
+        
+    Returns
+    -------
+    Ebeam : float
+        Beam energy [keV].
+    UA2 : float
+        A2 plate voltage [kV].
+    bool
+        if True then function fatbeam_calc skips setted Ebeam and UA2.
+        If False then function fatbeam_calc calculates fatbeam for setted Ebeam and UA2.
+
+    """
+        
+    Ebeam, UA2 = None, None
+
+    # setup Ebeam and UA2 parameters
+    if Ebeam_orig == 'all' and UA2_orig == 'all':
+        Ebeam = tr.Ebeam
+        UA2 = tr.U['A2']
+        print('\nEbeam = {}, UA2 = {}'.format(Ebeam, UA2))
+        return Ebeam, UA2, False
+    
+    if Ebeam_orig != 'all' and UA2_orig == 'all':
+        if tr.Ebeam == float(Ebeam_orig) and UA2_orig == 'all':
+            Ebeam = tr.Ebeam
+            UA2 = tr.U['A2']
+            print('\nEbeam = {}, UA2 = {}'.format(Ebeam, UA2))
+            return Ebeam, UA2, False
         else:
-            plts = Plates(plts_name, beamline)
-        # add edges to plates object
-        index = int(edges_list.shape[0] / 2)
-        plts.set_edges(np.array([edges_list[0:index, :],
-                                 edges_list[index:, :]]))
-        # rotate plates edges
-        plts.rotate(plts_angles, beamline_angles)
-        # shift coords center and put into a dictionary
-        plts.shift(r_new)
-        # add plates to dictionary
-        geom.plates_dict[plts_name] = plts
+            UA2 = tr.U['A2']
+            # print('Error: No such Ebeam and UA2 set in traj_list\nEbeam = {}, UA2 = {}'.format(float(Ebeam_orig), UA2))
+            return Ebeam, UA2, True
 
-        # read Electric field arrays
-        Ex = np.load(dirname + '/' + plts_name + '_Ex.npy')
-        Ey = np.load(dirname + '/' + plts_name + '_Ey.npy')
-        Ez = np.load(dirname + '/' + plts_name + '_Ez.npy')
-
-        x = np.arange(domain[0], domain[1], domain[6])  # + r_new[0]
-        y = np.arange(domain[2], domain[3], domain[6])  # + r_new[1]
-        z = np.arange(domain[4], domain[5], domain[6])  # + r_new[2]
-
-        # make interpolation for Ex, Ey, Ez
-        Ex_interp = RegularGridInterpolator((x, y, z), Ex)
-        Ey_interp = RegularGridInterpolator((x, y, z), Ey)
-        Ez_interp = RegularGridInterpolator((x, y, z), Ez)
-        E_read = [Ex_interp, Ey_interp, Ez_interp]
-
-        E[plts_name] = E_read
-
-    return
-
-
-def read_B(Btor, Ipl, PF_dict, dirname='magfield', interp=True, plot=False):
-    '''
-    read Magnetic field values and create Bx, By, Bz, rho interpolants
-    '''
-    print('\n Reading Magnetic field')
-    B_dict = {}
-    for filename in os.listdir(dirname):
-        if 'old' in filename:
-            continue
-        elif filename.endswith('.dat'):
-            with open(dirname + '/' + filename, 'r') as f:
-                volume_corner1 = [float(i) for i in f.readline().split()[0:3]]
-                volume_corner2 = [float(i) for i in f.readline().split()[0:3]]
-                resolution = float(f.readline().split()[0])
-            continue
-        elif 'Tor' in filename:
-            print('Reading toroidal magnetic field...')
-            B_read = np.load(dirname + '/' + filename) * Btor
-            name = 'Tor'
-
-        elif 'Plasm_{}MA'.format(int(Ipl)) in filename:
-            print('Reading plasma field...')
-            B_read = np.load(dirname + '/' + filename)  # * Ipl
-            name = 'Plasm'
-
+    if Ebeam_orig == 'all' and UA2_orig != 'all':
+        if Ebeam_orig == 'all' and tr.U['A2'] == float(UA2_orig):
+            Ebeam = tr.Ebeam
+            UA2 = float(UA2_orig)
+            print('\nEbeam = {}, UA2 = {}'.format(Ebeam, UA2))
+            return Ebeam, UA2, False
         else:
-            name = filename.replace('magfield', '').replace('.npy', '')
-            print('Reading {} magnetic field...'.format(name))
-            Icir = PF_dict[name]
-            print('Current = ', Icir)
-            B_read = np.load(dirname + '/' + filename) * Icir
+            Ebeam = tr.Ebeam
+            # print('Error: No such Ebeam and UA2 set in traj_list\nEbeam = {}, UA2 = {}'.format(Ebeam, float(UA2_orig)))
+            return Ebeam, UA2, True
+        
+    if Ebeam_orig != 'all' and UA2_orig != 'all':
+        if tr.Ebeam == float(Ebeam_orig) and tr.U['A2'] == float(UA2_orig):
+            Ebeam = tr.Ebeam
+            UA2 = tr.U['A2']
+            print('\nEbeam = {}, UA2 = {}'.format(Ebeam, UA2))
+            return Ebeam, UA2, False
+        else:
+            # print('Error: No such Ebeam and UA2 set in traj_list\nEbeam = {}, UA2 = {}'.format(float(Ebeam_orig), float(UA2_orig)))
+            return Ebeam, UA2, True
+        
+    # return if none of the if failed
+    return Ebeam, UA2, True
 
-        B_dict[name] = B_read
+def fatbeam_set_new_RV0s(tr, n_filaments_xy, n_gamma, skip_center_traj, d_beam, foc_len):
+    
+    tr_fat_buff_list = [] # list contains trajectories with new RV0
+    drad = np.pi/180. # degrees converting constant
+    r0 = tr.RV0[0, :3]
+    v0_abs = np.linalg.norm(tr.RV0[0, 3:])
+    
+    for i in range(n_filaments_xy):
+    # skip center traj
+        if abs(i - (n_filaments_xy-1)/2) < 1e-6 and skip_center_traj:
+            continue
+        
+        # beam convergence angle
+        alpha_conv = np.arctan((i - (n_filaments_xy-1)/2) *
+                           (d_beam/(n_filaments_xy-1)) / foc_len)
+        
+        # set coords and velocity at the center of coord system
+        x = 0.0
+        y = -(i - (n_filaments_xy-1)/2) * (d_beam/(n_filaments_xy-1))
+        z = 0.0
+        r = np.array([x, y, z])
+        # print('XY filament number = {}'.format(i+1))
+        
+        v0 = v0_abs * np.array([-np.cos(alpha_conv),
+                            np.sin(alpha_conv), 0.])
+        
+        for gamma in np.arange(np.pi/n_gamma, 2*np.pi, np.pi/n_gamma):
+            # convert gamma to angles
+            gamma = gamma/drad
+            # print('gamma = ', gamma)
+            # create filaments new starting positions by rotating and shifting
+            r_rot = gf.rotate(r, axis=(1, 0, 0), deg=gamma)
+            r_rot = gf.rotate(r_rot, axis=(0, 0, 1), deg=tr.alpha)
+            r_rot = gf.rotate(r_rot, axis=(0, 1, 0), deg=tr.beta)
+            r_rot += r0
+            v_rot = gf.rotate(v0, axis=(1, 0, 0), deg=gamma)
+            v_rot = gf.rotate(v_rot, axis=(0, 0, 1), deg=tr.alpha)
+            v_rot = gf.rotate(v_rot, axis=(0, 1, 0), deg=tr.beta)
+            tr_fat = copy.deepcopy(tr)
+            tr_fat.RV0[0, :] = np.hstack([r_rot, v_rot])
+            
+            tr_fat_buff_list.append(tr_fat)
+            
+            if abs(y) < 1e-6:
+                break
+    return tr_fat_buff_list
 
-    # create grid of points
-    grid = np.mgrid[volume_corner1[0]:volume_corner2[0]:resolution,
-                    volume_corner1[1]:volume_corner2[1]:resolution,
-                    volume_corner1[2]:volume_corner2[2]:resolution]
 
-    B = np.zeros_like(B_read)
-    for key in B_dict.keys():
-        B += B_dict[key]
+def fatbeam_save_plots(path, Ebeam, UA2, traj_fat_beam, geom, Btor, Ipl, 
+                       slits_orig='all', rescale_plots=False, close_plots=False,
+                       save_plots=False):
+    
+    log = [] # list for interstep logs
+    masterlog = [] # list for log in dirname_params folder
+    dirname_EU = f"E{Ebeam}_U{UA2}"
+    
+    hbplot.plot_fatbeam(traj_fat_beam, geom, Btor, Ipl, n_slit=slits_orig, scale=2)
+    hbplot.plot_fatbeam(traj_fat_beam, geom, Btor, Ipl, n_slit=slits_orig, scale=2)
 
-#    cutoff = 10.0
-#    Babs = np.linalg.norm(B, axis=1)
-#    B[Babs > cutoff] = [np.nan, np.nan, np.nan]
+    # plot ionization zones and get coordinates of zones
+    coords_list = hbplot.plot_svs(traj_fat_beam, geom, Btor, Ipl, 
+                        n_slit=slits_orig, plot_prim=False, plot_sec=False, 
+                        plot_zones=True, plot_cut=False, plot_flux=False, 
+                        plot_geom=False, alpha_xy=0, alpha_zy=0, 
+                        plot_legend=True, plot_dots=True)
 
-    # plot B stream
-    if plot:
-        hbplot.plot_B_stream(B, volume_corner1, volume_corner2, resolution, grid,
-                         plot_sep=False, dens=2.0)
-    else: 
-        print('B loaded without plotting')
-
-    x = np.arange(volume_corner1[0], volume_corner2[0], resolution)
-    y = np.arange(volume_corner1[1], volume_corner2[1], resolution)
-    z = np.arange(volume_corner1[2], volume_corner2[2], resolution)
-    Bx = B[:, 0].reshape(grid.shape[1:])
-    By = B[:, 1].reshape(grid.shape[1:])
-    Bz = B[:, 2].reshape(grid.shape[1:])
-    if interp:
-        # make an interpolation of B
-        Bx_interp = RegularGridInterpolator((x, y, z), Bx, bounds_error = False)
-        By_interp = RegularGridInterpolator((x, y, z), By, bounds_error = False)
-        Bz_interp = RegularGridInterpolator((x, y, z), Bz, bounds_error = False)
-        print('Interpolants for magnetic field created')
-        B_list = [Bx_interp, By_interp, Bz_interp]
-    else:
-        B_list = [Bx, By, Bz]
-
-    return B_list
-
-
-# %% poloidal field coils
-def import_PFcoils(filename):
-    '''
-    import a dictionary with poloidal field coils parameters
-    {'NAME': (x center, y center, width along x, width along y [m],
-               current [MA-turn], N turns)}
-    Andreev, VANT 2014, No.3
-    '''
-    d = {}  # defaultdict(list)
-    with open(filename) as f:
-        for line in f:
-            if line[0] == '#':
+    # inspect all SV shapes in 3D
+    log = hbplot.plot_each_sv_3d(coords_list, geom, slits_orig)
+    
+    try:
+        # create new directory
+        os.makedirs(path, exist_ok=True)
+        """ save plots to path """
+        if os.path.exists(path):
+            # get info about plots
+            fig_nums = plt.get_fignums()
+            figs = [plt.figure(n) for n in fig_nums]
+        # resize and save plots
+        for i in range(len(figs)):
+            # plot whole overview on trajectory to see ionization zone
+            if i == 0:
+                if rescale_plots:
+                    figs[i].set_size_inches(20, 12.5)
+                if save_plots:
+                    figs[i].savefig(os.path.join(path, dirname_EU, "fatbeam_whole.png"), dpi=300)
                 continue
-            lineList = line.split(', ')
-            key, val = lineList[0], tuple([float(i) for i in lineList[1:]])
-            d[key] = val
-    return d
+            # plot trajectories hit slits close-up view
+            if i == 1:
+                if rescale_plots:
+                    figs[i].set_size_inches(20, 12.5)
+                figs[i].axes[0].set_xlim(3.8, 4.3)
+                figs[i].axes[0].set_ylim(0.7, 0.9)
+                figs[i].axes[1].set_xlim(0.05, 0.2)
+                figs[i].axes[1].set_ylim(1.55, 1.73)
+                figs[i].axes[2].set_ylim(-0.65, -0.50)
+                if save_plots:
+                    figs[i].savefig(os.path.join(path, dirname_EU, "fatbeam.png"), dpi=300)
+                continue
+            # plot Sample Volumes close-up view 2D
+            if i == 2:
+                if rescale_plots:
+                    figs[i].set_size_inches(20, 12.5)
+                if save_plots:    
+                    figs[i].savefig(os.path.join(path, dirname_EU, "sv.png"), dpi=300)
+                continue
+            # plot Sample Volumes close-up view 3D (might be 1-7 plots)
+            if rescale_plots:
+                figs[i].set_size_inches(20, 12.5)
+            if save_plots:
+                if slits_orig == 'all':
+                    slits_orig = 0
+                figs[i].savefig(os.path.join(
+                    path, dirname_EU, f"slit_{i-2+slits_orig}_shape.png"), dpi=300)
+        # close opened plots
+        for fig in figs:
+            if close_plots:
+                plt.close(fig)
 
+        """save file log.txt with initital parameters to folder"""
+        # create list with main parameters
+        logfile = log
+        # save log.txt to path
+        np.savetxt(os.path.join(path, dirname_EU, "log.txt"), logfile, fmt='%s')
+        
+        # save masterlog.txt to dirname_params folder
+        masterlog.append(f"E{Ebeam}_U{UA2}")
+        for log in logfile:
+            masterlog.append(log)
+        with open(os.path.join(path, 'masterlog.txt'), 'a') as f:
+            np.savetxt(f, masterlog, fmt='%s')
 
-def import_PFcur(filename, pf_coils):
-    '''
-    Creates dictionary with coils names and currents from TOKAMEQ file
-    filename : Tokameqs filename
-    pf_coils : coil dict (we only take keys)
-    '''
-    with open(filename, 'r') as f:
-        data = f.readlines()  # read tokameq file
-    PF_dict = {}  # Here we will store coils names and currents
-    pf_names = list(pf_coils)  # get coils names
-    n_coil = 0  # will be used for getting correct coil name
-    for i in range(len(data)):
-        if data[i].strip() == 'External currents:':
-            n_line = i + 2  # skip 2 lines and read from the third
-            break
-    while float(data[n_line].strip().split()[3]) != 0:
-        key = pf_names[n_coil]
-        val = data[n_line].strip().split()[3]
-        PF_dict[key] = float(val)
-        n_line += 1
-        n_coil += 1
+    except:
+        fig_nums = plt.get_fignums()
+        figs = [plt.figure(n) for n in fig_nums]
+        if close_plots:
+            for fig in figs:
+                plt.close(fig)
+        print('Nothing saved!')
 
-    return PF_dict
+def fatbeam_create_table(path):
+    
+    masterlog_name = os.path.join(path, 'masterlog.txt')
+    
+    with open(masterlog_name) as f:
+        data = f.read()
+    
+    # Split the data into records
+    records = data.strip().split('\n\n')
+    
+    # Create an empty list to store parsed data
+    parsed_data = []
+    
+    # Parse each record
+    for record in records:
+        try:
+            lines = record.split('\n')
+            E, U = lines[0].split('_')
+            E = float(E[1:])
+            U = float(U[1:])
+            rho = float(lines[4].split(': ')[1].split(',')[0])
+            theta = float(lines[4].split(': ')[1].split(',')[1])
+            combined_value = f"{rho:.3f} \\ {theta:.3f}"  # Combine rho and theta with a backslash
+            parsed_data.append([E, U, combined_value])
+        except:
+            pass
+    
+    # Create a Pandas DataFrame
+    df = pd.DataFrame(parsed_data, columns=["E", "U", "rho\\theta"])
+    
+    # Display DataFrame
+    print(df)
+    
+    # Create a cross-table
+    cross_table = df.pivot(index='E', columns='U', values='rho\\theta')
+    
+    # Display the cross-table
+    print(cross_table)
+    
+    masterlog_name_excel = os.path.join(path, 'masterlog.xlsx')
+ 
+    # saving the excel
+    cross_table.to_excel(masterlog_name_excel)
 
+def fatbeam_calc(traj_list, E, B, geom, Btor, Ipl, Ebeam_orig='all', UA2_orig='all', 
+                 target='slit', slits_orig='all', d_beam=0.02, foc_len=50, 
+                 n_filaments_xy=3, n_gamma=1, timestep_divider=10, dt=2.0e-8, 
+                 calc_mode='cpu', load_traj=False, save_traj=False, 
+                 path_orig='fatbeam\\results', skip_center_traj=False, tmax=1e-5, 
+                 invisible_wall_x=5.5, plot_trajs=False, rescale_plots=False,
+                 close_plots=False, save_plots=False, create_table=False):
+    
+    """
+    
+    Function takes optimized trajectories list and calculates fatbeam for them.
+    
+    Parameters
+    ----------
+    traj_list : List with trajectories
+        list with optimized trajectories with different Ebeam and UA2.
+    E : dict
+        dictionary with E field interpolants.
+    B : list
+        list with B fied interpolants.
+    geomT15 : Geometry object
+        Geometry of T-15MD.
+    Btor : float
+        Magnetic field [T].
+    Ipl : float
+        Plasma current [kA].
+    Ebeam_orig : float/str, optional
+        Beam energy [keV] or 'all'.
+        'all' - wil calc for all Ebeam values from traj_list.
+        The default is 'all'.
+    UA2_orig : float or str, optional
+        A2 plate voltage [kV] or 'all'.
+        'all' - wil calc for all UA2 values from traj_list.
+        The default is 'all'.
+    Examples: Ebeam_orig='all', UA2_orig='all' - calc for all grid
+              Ebeam_orig='200', UA2_orig='all' - calc for all UA2 for all available Ebeams
+              Ebeam_orig='all', UA2_orig='10' - calc for all Ebeams for all available UA2s
+    target : str, optional
+        'det' - to analyzer. 'slit' - to slits.
+        The default is 'slit'.
+    slist_orig : int or list or str, optional
+        Examples: slist_orig = 4 - for slit number 4 (central slit).
+                  slist_orig = [1, 2] - for slits number 1 and 2.
+                  slist_orig = 'all' - for all slits.
+                  The default is 'all'.
+    d_beam : float, optional
+        beam diameter [m]. The default is 0.02.
+    n_filaments_xy : int, optional
+        number of filaments in xy plane (must be ODD). The default is 3.
+    n_gamma : int, optional
+        amount of fat beam chords. The default is 4.
+    foc_len : float, optional
+        distance from the first point of the trajectory to the focus [m]. 
+        The default is 50.
+    timestep_divider : int, optional
+        density of secondary trajectories on each filament. The default is 10.
+    skip_center_traj : bool, optional
+        If true - to not calc center (main) trajectory. The default is False.
+    calc_mode : str, optional
+        'gpu' or 'cpu' or 'skip' calculation modes. The default is 'cpu'.
+        'cpu' - uses joblib=1.3.2, python>=3.11.6
+        'gpu' - NOT IMPLEMENTED YET (will use pytorch, gpuparallel=0.2.2) # !!!
+        'skip' - do not calculate fatbeam. Skip calculatuion.
+    dt : float, optional
+        timestep for RK algorithm [s]. The default is 0.2e-7.
+    load_traj : bool
+        flag for loading trajectories from path_orig if exists.
+        The default is False.
+    save_traj : bool
+        flag for saving trajectories to path_orig. The default is False.
+        Notice: if load_traj == True - not working.
+    path_orig : str
+        saving path
+        The default is 'fatbeam\\results'.
+    tmax : float, optional
+        tmax for pass_prim method of trajectory class. The default is 1e-5.
+    invisible_wall_x : float, optional
+        Position of invisible wall (hitbox) on x Axis. The default is 5.5.
+    plot_trajs : bool
+        flag for plotting fatbeam for each Ebeam and UA2 set.
+        Plots several figures:
+            1) Whole overview on fatbeam trajectory
+            2) Trajectories hit slits close-up view
+            3) Sample Volumes close-up view 2D
+            4-10) Sample Volumes close-up view 3D (might be from 1 to 7 figures
+                                                   depends on slits number)
+    rescale_plots : bool
+        flag for rescale plots to 2K resolution
+        The default is False.
+        Notice: works properly on 2K monitor. FHD Monitors cause annoying warnings.
+    close_plots : bool
+        flag if close_plots == True closes openned plots.
+        Notice: Not working if save_plots == True.
+        The default is False.
+    save_plots : bool
+        flag for saving plots and logs.
+        The default is False.
+    create_table : bool
+        flag to create excel table with pho/theta/mizlaf
+        mizlaf - Max Ioiniztion Zone Length Along Filament
+        Will run after excecuting ALL calculations.
+        The default is False.
+    Returns
+    -------
+    traj_fat_beam : list
+        list contains fat beam trajectories (Traj Class).
+
+    """
+    
+    traj_fat_beam = [] # result list
+    
+    for tr in traj_list:
+        # select which Ebeam and UA2 use for calculation
+        Ebeam, UA2, selector = fatbeam_E_UA2_selector(tr, Ebeam_orig, UA2_orig)
+        if selector:
+            continue
+        
+        # setup slit numbers
+        if slits_orig == 'all':
+            slits = range(7)
+        else:
+            slits = [int(slits_orig)-1]
+        
+        # path to create folder and save plots and log.txt
+        dirname_BI = f"B{round(Btor,1)}_I{round(Ipl,1)}"
+        dirname_params = f"sl_{slits_orig}_dbeam{d_beam}_focl{foc_len}_fil{n_filaments_xy}_ngam{n_gamma}"
+        pre_path = os.path.join(path_orig, dirname_BI, dirname_params)
+        path = os.path.join(path_orig, dirname_BI, dirname_params, f"E{Ebeam}_U{UA2}")
+        
+        if not load_traj: # calc traj
+            tr_fat_buff_list = [] # list contains trajectories with new RV0
+            # calculating new RV0 for trajectory using filaments and n_gamma (chords)
+            tr_fat_buff_list, *_ = fatbeam_set_new_RV0s2(tr, n_filaments_xy, n_gamma, skip_center_traj, d_beam, foc_len)
+            
+            if calc_mode == 'cpu':
+                # main calc multiprocessing using joblib=1.3.2
+                traj_fat_beam = Parallel(n_jobs=-1, verbose=5)(delayed(fatbeam_calc_core)(tr,
+                                            dt, E, B, geom, target=target,
+                                          slits=slits, timestep_divider=timestep_divider,
+                                          tmax=tmax, invisible_wall_x=invisible_wall_x) for tr in tr_fat_buff_list)
+            elif calc_mode == 'cpu_unparallel':
+                for tr in tr_fat_buff_list:
+                    traj_fat_beam.append(fatbeam_calc_core(tr, dt, E, B, geom, target=target,
+                                      slits=slits, timestep_divider=timestep_divider,
+                                      tmax=tmax, invisible_wall_x=invisible_wall_x, print_log=True)) 
+            elif calc_mode == 'skip':
+                pass
+            
+            if save_traj:
+                save_traj_list_fb(traj_fat_beam, Ebeam, UA2, dirname=path)
+            
+        else: # load traj from file
+            try: # try to load saved fatbeam trajectory
+                traj_fat_beam = read_traj_list_fb(Ebeam, UA2, dirname=path)
+            except:
+                print(f'Error: Can\'t load E{Ebeam}_U{UA2}. No such file or broken file.')
+                continue
+        
+        # plot savings
+        if plot_trajs:
+            if slits_orig != 'all':
+                slits = int(slits_orig)-1
+            
+            fatbeam_save_plots(pre_path, Ebeam, UA2, traj_fat_beam, geom, 
+                               Btor, Ipl, slits_orig=slits, 
+                               rescale_plots=rescale_plots, 
+                               close_plots=close_plots, save_plots=save_plots)
+    
+    if create_table:
+        fatbeam_create_table(pre_path)
+
+    return traj_fat_beam
 
 # %%
-def import_Bflux(filename):
-    '''
-    import magnetic flux from Tokameq file
-    '''
-    with open(filename, 'r') as f:
-        data = f.readlines()
 
-    # R coordinate corresponds to X, Z coordinate corresponds to Y
-    NrNz = []
-    for i in data[2].strip().split():
-        if i.isdigit():
-            NrNz.append(i)
-    Nx = int(NrNz[0]) + 1
-    Ny = int(NrNz[1]) + 1
-
-    for i in range(len(data)):
-        if ' '.join(data[i].strip().split()[:4]) == 'Flux at the boundary':
-            bound_flux = float(data[i].strip().split()[-1])
-        if data[i].strip() == 'Poloidal flux F(r,z)':
-            index = i
-
-    x_vals = [float(r) for r in data[index+1].strip().split()[1:]]
-    x_vals = np.array(x_vals)
-
-    Psi_data = [i.strip().split() for i in data[index+2:index+2+Ny]]
-    Psi_vals = []
-    y_vals = []
-    for line in Psi_data:
-        y_vals.append(float(line[0]))
-        Psi_vals.append([float(j) for j in line[1:]])
-
-    y_vals = np.array(y_vals)
-    Psi_vals = np.array(Psi_vals)
-    return Psi_vals, x_vals, y_vals, bound_flux
-
-
-# %%
-def save_traj_list(traj_list, Btor, Ipl, r_aim, dirname='output'):
+def save_traj_list(traj_list, Btor, Ipl, beamline, dirname='output'):
     '''
     save list of Traj objects to *.pkl file
     '''
@@ -2084,20 +2321,23 @@ def save_traj_list(traj_list, Btor, Ipl, r_aim, dirname='output'):
             if e.errno != errno.EEXIST:
                 raise
 
-    fname = dirname + '/' + 'E{}-{}'.format(int(min(Ebeam_list)),
-                                            int(max(Ebeam_list))) + \
-        '_UA2{}-{}'.format(int(min(UA2_list)), int(max(UA2_list))) + \
-        '_alpha{:.1f}_beta{:.1f}'.format(traj.alpha, traj.beta) +\
-        '_x{}y{}z{}.pkl'.format(int(r_aim[0]*100), int(r_aim[1]*100),
-                                int(r_aim[2]*100))
+    # fname = dirname + '/' + 'E{}-{}'.format(int(min(Ebeam_list)),
+    #                                         int(max(Ebeam_list))) + \
+    #     '_UA2{}-{}'.format(int(min(UA2_list)), int(max(UA2_list))) + \
+    #     '_alpha{:.1f}_beta{:.1f}'.format(traj.alpha, traj.beta) +\
+    #     'beamline {}'.format(beamline)
+
+    fname = dirname + '/' + \
+            'Btor {}'.format(Btor) + 'beamline {}'.format(beamline)
 
     with open(fname, 'wb') as f:
         pc.dump(traj_list, f, -1)
 
     print('\nSAVED LIST: \n' + fname)
 
-
 # %%
+
+
 def read_traj_list(fname, dirname='output'):
     '''
     import list of Traj objects from *.pkl file
@@ -2106,8 +2346,9 @@ def read_traj_list(fname, dirname='output'):
         traj_list = pc.load(f)
     return traj_list
 
-
 # %%
+
+
 def save_traj2dat(traj_list, save_fan=False, dirname='output/',
                   fmt='%.2f', delimiter=' '):
     '''
@@ -2115,195 +2356,148 @@ def save_traj2dat(traj_list, save_fan=False, dirname='output/',
     '''
     for tr in traj_list:
         # save primary
-        fname = dirname + 'E{:.0f}_U{:.0f}_prim.dat'.format(tr.Ebeam, tr.U['A2'])
+        fname = dirname + \
+            'E{:.0f}_U{:.0f}_prim.dat'.format(tr.Ebeam, tr.U['A2'])
         np.savetxt(fname, tr.RV_prim[:, 0:3]*1000,
                    fmt=fmt, delimiter=delimiter)  # [mm]
         # save secondary
-        fname = dirname + 'E{:.0f}_U{:.0f}_sec.dat'.format(tr.Ebeam, tr.U['A2'])
+        fname = dirname + \
+            'E{:.0f}_U{:.0f}_sec.dat'.format(tr.Ebeam, tr.U['A2'])
         np.savetxt(fname, tr.RV_sec[:, 0:3]*1000,
                    fmt=fmt, delimiter=delimiter)
 
+# %% sec beamline optimization
 
-# %%
-def save_png(fig, name, save_dir='output'):
-    '''
-    saves picture as name.png
-    fig : array of figures to save
-    name : array of picture names
-    save_dir : directory used to store results
-    '''
 
-    # check wether directory exist and if not - create one
-    if not os.path.isdir(save_dir):
-        os.makedirs(save_dir)
-        print('LOG: {} directory created'.format(save_dir))
-    print('LOG: Saving pictures to {}'.format(save_dir+'/'))
-    for fig, name in zip(fig, name):
-        # save fig with tight layout
-        fig_savename = str(name + '.png')
-        fig.savefig(save_dir + '/' + fig_savename, bbox_inches='tight')
-        print('LOG: Figure ' + fig_savename + ' saved')
+def optimize(tr, optimizer, E, B, geom, RV0, tmax, eps_xy, eps_z):
+    while True:
+        # print('\n passing secondary trajectory')
+        tr.pass_sec(RV0, optimizer.r_target, E, B, geom, tmax=tmax,
+                    eps_xy=eps_xy, eps_z=eps_z, stop_plane_n=optimizer.stop_plane_n)
+        if not optimizer.change_voltages(tr):
+            return optimizer.voltages_list
+        # print('\n changing voltages')
 
-#%% Interpolator
 
-class MagFieldInterpolator():
-    '''
-    Interpolates vector on 3d grid with equal steps
-    '''
-    
-    def __init__(self, grid, volume_corner1, volume_corner2, resolution, B):
-        self.grid = grid
-        self.volume_corner1 = volume_corner1
-        self.volume_corner2 = volume_corner2
-        self.res = resolution
-        self.B = B
-    
-    def __call__(self, point):
-        #if point is outside the volume - return array of np.nan-s
-        if np.any(point - self.volume_corner1 - self.res <= 0) or np.any(self.volume_corner2 - point - self.res <= 0):
-            return np.full((1, 3), np.nan)[0]
-        
-        #finding indexes of left corner of volume with point
-        indexes_float = (point - self.volume_corner1)/self.res // 1
-        indexes = [[0]*3]*8
-        for i in range(3):
-            indexes[0][i] = int(indexes_float[i])
-        
-        # finding weights for all dots close to point
-        '''
-        delta_x = [x2 - x, x - x1]
-        point = [x, y, z]
-        '''
-        
-        i00 = indexes[0][0]
-        j01 = indexes[0][1]
-        k02 = indexes[0][2]
-        
-        left_bottom = self.grid[:, i00,     j01,     k02]        
-        right_top   = self.grid[:, i00 + 1, j01 + 1, k02 + 1]
-        #delta = (right_top - point,   point - left_bottom)
-        
-        delta_x = [right_top[0] - point[0],   point[0] - left_bottom[0] ] 
-        delta_y = [right_top[1] - point[1],   point[1] - left_bottom[1] ]  
-        delta_z = [right_top[2] - point[2],   point[2] - left_bottom[2] ] 
-        
-        res_cubic = self.res**3
-        number = 0
-        weights = [0.]*8
-        for i in range(2):
-            for j in range (2):
-                for k in range(2):
-                    weights[number] = delta_x[i]*delta_y[j]*delta_z[k]/res_cubic
-                    number += 1
+def _optimize(tr, optimizer, E, B, geom, RV0, tmax, eps_xy, eps_z, plot_all=False):
+    uu = np.linspace(-40.0, 40.0, 41)
+    dd = np.zeros_like(uu)
+    # dd_v, dd_h, dd_x = np.zeros_like(uu), np.zeros_like(uu), np.zeros_like(uu)
+    for i, u in enumerate(uu):
+        optimizer.set_voltage(tr, u)
+        tr._pass_sec(RV0, optimizer.r_target, E, B, geom, tmax=tmax,
+                     eps_xy=eps_xy, eps_z=eps_z, stop_plane_n=optimizer.stop_plane_n,
+                     break_at_intersection=True)
+        dd[i] = optimizer.calc_delta(tr.RV_sec[-1])
 
-        # weights.append((delta_x2)*(y2 - y)*(z2 - z)/(res_cubic))
-        # weights.append((delta_x2)*(y2 - y)*(z - z1)/(res_cubic))
-        # weights.append((delta_x2)*(y - y1)*(z2 - z)/(res_cubic))
-        # weights.append((delta_x2)*(y - y1)*(z - z1)/(res_cubic))
-        # weights.append((x - x1)*(y2 - y)*(z2 - z)/(res_cubic))
-        # weights.append((x - x1)*(y2 - y)*(z - z1)/(res_cubic))
-        # weights.append((x - x1)*(y - y1)*(z2 - z)/(res_cubic))
-        # weights.append((x - x1)*(y - y1)*(z - z1)/(res_cubic))
-        
-        #finding interpolation
-        Bx = 0.0
-        By = 0.0
-        Bz = 0.0
+        #dd_v[i], dd_h[i] = optimizer.calc_delta_vector(last_r)
+        # dd_x[i], dd_v[i], dd_h[i] = last_r
+        if plot_all:
+            plt.figure(225)
+            tr.plot_prim(plt.gca(), 'XY')
+            tr.plot_sec(plt.gca(), 'XY')
 
-#        for i in range(8):
-#            Bx += weights[i]*self.B[0][indexes[i][0], indexes[i][1], indexes[i][2]]
-#            By += weights[i]*self.B[1][indexes[i][0], indexes[i][1], indexes[i][2]]
-#            Bz += weights[i]*self.B[2][indexes[i][0], indexes[i][1], indexes[i][2]]
-        
-        _Bx = self.B[0]
-        _By = self.B[1]
-        _Bz = self.B[2]
-        for ijk in range(8):
-            i = ( ijk >> 2 ) % 2
-            j = ( ijk >> 1 ) % 2
-            k =   ijk % 2 
-            
-            Bx += weights[ijk]* _Bx[i00 + i, j01 + j, k02 + k]
-            By += weights[ijk]* _By[i00 + i, j01 + j, k02 + k]
-            Bz += weights[ijk]* _Bz[i00 + i, j01 + j, k02 + k]
+            plt.figure(229)
+            tr.plot_prim(plt.gca(), 'XZ')
+            tr.plot_sec(plt.gca(), 'XZ')
+        # print(dd[i])
 
-        return np.array([[Bx, By, Bz]])
-    
-# %%
-# read_B for tests
+    # plt.figure(223)
+    # plt.plot(uu, dd)
 
-def read_B_new(Btor, Ipl, PF_dict, dirname='magfield', interp=True, plot=False):
-    '''
-    read Magnetic field values and create Bx, By, Bz, rho interpolants
-    '''
-    print('\n Reading Magnetic field')
-    B_dict = {}
-    for filename in os.listdir(dirname):
-        if 'old' in filename:
-            continue
-        elif filename.endswith('.dat'):
-            with open(dirname + '/' + filename, 'r') as f:
-                volume_corner1 = [float(i) for i in f.readline().split()[0:3]]
-                volume_corner2 = [float(i) for i in f.readline().split()[0:3]]
-                resolution = float(f.readline().split()[0])
-            continue
-        elif 'Tor' in filename:
-            print('Reading toroidal magnetic field...')
-            B_read = np.load(dirname + '/' + filename) * Btor
-            name = 'Tor'
+            plt.figure(300)
+            plt.plot(uu, dd)
+    # plt.figure(301)
+    # plt.plot(uu, dd_h)
+    # plt.figure(302)
+    # plt.plot(dd_h, dd_v)
+    # plt.plot(dd_x, dd_h)
 
-        elif 'Plasm_{}MA'.format(int(Ipl)) in filename:
-            print('Reading plasma field...')
-            B_read = np.load(dirname + '/' + filename)  # * Ipl
-            name = 'Plasm'
-
-        else:
-            name = filename.replace('magfield', '').replace('.npy', '')
-            print('Reading {} magnetic field...'.format(name))
-            Icir = PF_dict[name]
-            print('Current = ', Icir)
-            B_read = np.load(dirname + '/' + filename) * Icir
-
-        B_dict[name] = B_read
-
-    # create grid of points
-    grid = np.mgrid[volume_corner1[0]:volume_corner2[0]:resolution,
-                    volume_corner1[1]:volume_corner2[1]:resolution,
-                    volume_corner1[2]:volume_corner2[2]:resolution]
-
-    B = np.zeros_like(B_read)
-    for key in B_dict.keys():
-        B += B_dict[key]
-
-#    cutoff = 10.0
-#    Babs = np.linalg.norm(B, axis=1)
-#    B[Babs > cutoff] = [np.nan, np.nan, np.nan]
-
-    # plot B stream
-    if plot:
-        hbplot.plot_B_stream(B, volume_corner1, volume_corner2, resolution, grid,
-                         plot_sep=False, dens=2.0)
-    else: 
-        print('B loaded without plotting')
-
-    Bx = B[:, 0].reshape(grid.shape[1:])
-    By = B[:, 1].reshape(grid.shape[1:])
-    Bz = B[:, 2].reshape(grid.shape[1:])
-    if interp:
-        # make an interpolation of B
-        B_list = MagFieldInterpolator(grid, volume_corner1, volume_corner2, resolution, [Bx, By, Bz])
-        print('Interpolants for magnetic field created')
+    i, iplus1, t = find_fork(dd, threshold=optimizer.aim_zone_size)
+    if i is None:
+        return []
     else:
-        B_list = [Bx, By, Bz]
+        U = uu[i] + (uu[iplus1]-uu[i])*t
+        optimizer.set_voltage(tr, U)
+        tr._pass_sec(RV0, optimizer.r_target, E, B, geom, tmax=tmax,
+                     eps_xy=eps_xy, eps_z=eps_z, stop_plane_n=optimizer.stop_plane_n,
+                     break_at_intersection=True)
 
-    return B_list
+        return [U]
 
-#%%
-#return_B for tests
+        # print('\n changing voltages')
 
-def return_B_new(r, Bin):
-    '''
-    interpolate Magnetic field at point r
-    '''
 
-    return Bin(r)
+def optimize_sec_fine(E, B, geom, traj_list, optimization_mode="center",
+                      target='slit', max_voltages=[40., 40., 40.], eps_xy=1e-3,
+                      eps_z=1e-3, tmax=9e-5, U0=[0., 0., 0.], dU=[7, 10, 5.]):
+
+    # create list for results
+    traj_list_passed = []
+
+    # create 3 optimizers
+    opt_A3 = optimizers.Optimizer(
+        'zone',            dU[0], max_voltages[0], 'A4', geom, 'A3', aim_rough=0.2)
+    print('aim_zone_size', opt_A3.aim_zone_size)
+    opt_B3 = optimizers.Optimizer(
+        optimization_mode, dU[1], max_voltages[1], target, geom, 'B3')
+    opt_A4 = optimizers.Optimizer(
+        optimization_mode, dU[2], max_voltages[2], target, geom, 'A4')
+    opt_B3_A4 = optimizers.Multiple_optimizer([opt_B3, opt_A4])
+
+    for tr in traj_list:
+
+        print('\nEb = {}, UA2 = {}'.format(tr.Ebeam, tr.U['A2']))
+        print('Target: ' + target)
+
+        # set start point and voltages
+        RV0 = np.array([tr.RV_sec[0]])
+        tr.U['A3'], tr.U['B3'], tr.U['A4'] = U0
+
+        # reset optimizers
+        A3_voltages, B3_voltages, A4_voltages = [], [], []
+        opt_A3.voltages_list = []
+        opt_A3.count = 0
+        opt_A3.U_step = None
+        for optimizer in opt_B3_A4.optimizers:
+            optimizer.voltages_list = []
+            optimizer.count = 0
+            optimizer.U_step = None
+
+        # -------------- optimize plates one by one --------------------
+        A3_voltages = _optimize(tr, opt_A3, E, B, geom,
+                                RV0, tmax, eps_xy, eps_z)
+        B3_voltages = _optimize(tr, opt_B3, E, B, geom,
+                                RV0, tmax, eps_xy, eps_z)
+        A4_voltages = _optimize(tr, opt_A4, E, B, geom,
+                                RV0, tmax, eps_xy, eps_z)
+        print("A3 voltages: ", A3_voltages)
+        print("B3 voltages: ", B3_voltages)
+        print("A4 voltages: ", A4_voltages)
+
+        # finish optimization and write down results
+        if (not A4_voltages) or (not B3_voltages) or (True in tr.IntersectGeometrySec.values()):
+            print("\nOptimization failed, trajectory NOT saved\n")
+        else:
+            print("\nTrajectory optimized and saved\n")
+            traj_list_passed.append(tr)
+
+    return traj_list_passed
+
+# %% different radref calculations
+
+
+def calc_radrefs_2d_separatrix(traj_list, geom):
+    r_center = np.array([geom.R, 0.])
+    sep = copy.deepcopy(geom.sep)
+    sep[:, 0] += geom.R
+    for tr in traj_list:
+        r = tr.RV_sec[0, 0:2]
+        r_local = r - r_center
+        theta = math.atan2(r_local[1], r_local[0])
+        for segm_0, segm_1 in zip(sep[:-1], sep[1:]):
+            rho = gf.ray_segm_intersect_2d((r_center, r), (segm_0, segm_1))
+            if rho is not None:
+                break
+        tr.rho = rho
+        tr.theta = theta

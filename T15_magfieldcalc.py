@@ -1,16 +1,20 @@
 # calculate magnetic fields arising from electrical current through wires of an
 # arbitrary shape with the law of Biot-Savart
 
-import numpy as np
-import wire
-from joblib import Parallel, delayed
-import multiprocessing as mp
-import time
-import hibplib as hb
-import hibpplotlib as hbplot
 import os
 import sys
+import time
+import numpy as np
+import multiprocessing as mp
+from joblib import Parallel, delayed
+import hibplib as hb
+import hibpplotlib as hbplot
+import hibpcalc.fields as fields
+import wire
 
+#%% constants
+SI_mu0      = 4.0*np.pi*1e-7
+MAGFIELD_COEFF = SI_mu0/4.0*np.pi
 
 # %% define a fuction to calculate Biot-Savart IdL * r/|r|^3
 def calc_Bpoint(r, IdL, r1):
@@ -19,14 +23,14 @@ def calc_Bpoint(r, IdL, r1):
     # create a mask to exclude points close to wire
     mask = (r25 < EPS_WIRE)  # 0.6 is ok for plasma current field
     r25 = r25**3
-    r3 = r2 / r25[:, np.newaxis]
+    r3 = r2 / r25[:, np.newaxis]   # .T ?
 
     cr = np.cross(IdL, r3)
     cr[mask] = [0., 0., 0.]
 
     # claculate sum of contributions from all current elements
     s = np.sum(cr, axis=0)
-    return s
+    return s  # *MAGFIELD_COEFF
 
 
 # %% define a fuction to calculate Biot-Savart law
@@ -57,6 +61,7 @@ def biot_savart(points, wires):
         else:
             IdL = np.vstack((IdL, _IdL))
             r1 = np.vstack((r1, _r1))
+
     print('total number of segments: {}'.format(len(IdL)))
     print('number of field points: {}'.format(len(points)))
     print('total number of calculations: {}'.format(len(points)*len(IdL)))
@@ -73,9 +78,9 @@ def biot_savart(points, wires):
 
     # multiprocessing
     n_workers = mp.cpu_count() - 1
-    s = Parallel(n_jobs=n_workers)(delayed(calc_Bpoint)(r, IdL, r1) for
-                                   r in points)
-    B = np.array(s)*1e-7
+    s = Parallel (n_jobs=n_workers) (delayed(calc_Bpoint)(r, IdL, r1) for r in points)
+    
+    B = np.array(s)*1e-7   # SI_mu0 /4pi
 
     t2 = time.time()
     print('time needed for calculation: {:.5f} s\n'.format(t2-t1))
@@ -241,8 +246,7 @@ def calc_Bplasm(points, filename, CurrTot, disc_len=0.2):
     # import plasma current density
     J_vals, x_vals, y_vals = import_Jplasm(filename)
     step_x, step_y = 3, 3
-    J_vals = J_vals[step_x:J_vals.shape[0]:step_x,
-                    step_y:J_vals.shape[1]:step_y]
+    J_vals = J_vals[step_x:J_vals.shape[0]:step_x,  step_y:J_vals.shape[1]:step_y]
     x_vals = x_vals[step_x:x_vals.shape[0]:step_x]
     y_vals = y_vals[step_y:y_vals.shape[0]:step_y]
     print(J_vals.shape)
@@ -273,9 +277,7 @@ def calc_Bplasm(points, filename, CurrTot, disc_len=0.2):
                 # concatenate in one np array
                 new_coil = np.c_[x, y, z]
                 # create new wire object for calculation by Biotsavart script
-                new_w = wire.Wire(path=new_coil,
-                                  discretization_length=disc_len,
-                                  current=1e6*CurrTot*J_vals[j, i]/Jtot)
+                new_w = wire.Wire(path=new_coil, discretization_length=disc_len, current=1e6*CurrTot*J_vals[j, i]/Jtot)
                 wires.append(new_w)
     B = biot_savart(points, wires)
     return B, wires
@@ -331,7 +333,7 @@ if __name__ == '__main__':
             print('\nNo previous magnetic field found')
 
     Btor = 1.0  # Toroidal field [Tl]
-    Ipl = 2.0  # Plasma current [MA]
+    Ipl = 1.5  # Plasma current [MA]
 
     # Define grid points to caculate B
     resolution = 0.02  # 0.05  # 0.01    # [m]
@@ -361,8 +363,8 @@ if __name__ == '__main__':
 
     # calculate plasma current field
     # *.txt with plasma current calculated in Tokameq
-    tokameq_file = '2MA_sn.txt'
-    EPS_WIRE = 0.6  # parameter to make smooth plasma approximation
+    tokameq_file = '1.5MA_sn.txt'
+    EPS_WIRE = 0.05  # parameter to make smooth plasma approximation
     B_pl, wires_pl = calc_Bplasm(points, tokameq_file, Ipl, disc_len=disc_len)
     # sys.exit()
 
@@ -371,7 +373,7 @@ if __name__ == '__main__':
     B_tor, wires_tor = calc_Btor(points, disc_len=disc_len)
 
     # calculate poloidal magnetic field
-    pf_coils = hb.import_PFcoils('PFCoils.dat')
+    pf_coils = fields.import_PFcoils('PFCoils.dat')
     B_pol_dict, wires_pol = calc_Bpol(pf_coils, points, disc_len=disc_len)
 
     # wires = wires_pol + wires_tor + wires_pl
@@ -388,7 +390,7 @@ if __name__ == '__main__':
     B_total = B_tor*Btor + B_pl
 
     # get real currents in toroidal coils
-    PF_dict = hb.import_PFcur(tokameq_file, pf_coils)
+    PF_dict = fields.import_PFcur(tokameq_file, pf_coils)
     for coil in B_pol_dict.keys():
         Babs_pol = np.linalg.norm(B_pol_dict[coil], axis=1)
         B_pol_dict[coil][Babs_pol > cutoff] = [np.nan, np.nan, np.nan]
@@ -396,18 +398,19 @@ if __name__ == '__main__':
 
 # %% SAVE DATA
     if save_data:
+        dirname='magfield_new'
         # save geometry
         save_B_geometry(volume_corner1, volume_corner2, resolution)
         # save Toroidal field
         fname = 'magfieldTor'
-        save_B(fname, B_tor)
+        save_B(fname, B_tor, dirname=dirname)
         # save Plasma field
         fname = 'magfieldPlasm_{}'.format(tokameq_file[0:6])
-        save_B(fname, B_pl)
+        save_B(fname, B_pl, dirname=dirname)
         # save Poloidal field
         for coil in B_pol_dict.keys():
             fname = 'magfield{}'.format(coil)
-            save_B(fname, B_pol_dict[coil])
+            save_B(fname, B_pol_dict[coil], dirname=dirname)
     else:
         print('DATA NOT SAVED')
 
