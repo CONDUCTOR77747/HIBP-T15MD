@@ -771,13 +771,13 @@ if calculate_zones:
                           'timestep_divider':20,
                           'dt':2e-8,
                           'calc_mode':'cpu', # cpu_unparallel
-                          'load_traj':True,
-                          'save_traj':False,
+                          'load_traj':False,
+                          'save_traj':True,
                           'path_orig': os.path.join('fatbeam', 'results', 'fix_cylinder'),
                           'plot_trajs': True,
                           'rescale_plots': False,
-                          'close_plots': False,
-                          'save_plots': False,
+                          'close_plots': True,
+                          'save_plots': True,
                           'create_table': False}
         
         t1 = time.time()
