@@ -19,6 +19,7 @@ from hibpcalc.misc import SecBeamlineData
 import hibplib as hb
 import hibpplotlib as hbplot
 import define_geometry as defgeom
+from contexttimer import Timer
 
 # %% additional functions
 
@@ -760,7 +761,7 @@ if calculate_zones:
                         Btor,
                         Ipl]
         
-        mode = 'load' # 'load' and 'save' modes
+        mode = 'save' # 'load' and 'save' modes
         if mode == 'save':
             load_traj = False
             save_traj = True
@@ -776,16 +777,16 @@ if calculate_zones:
             close_plots = False
             save_plots = False
         
-        fatbeam_kwargs = {'Ebeam_orig':'260',
+        fatbeam_kwargs = {'Ebeam_orig':'240',
                           'UA2_orig':'10',
                           'target':'slit',
-                          'slits_orig':'4',
-                          'd_beam':0.002,
+                          'slits_orig':'3',
+                          'd_beam':0.001,
                           'foc_len':50,
                           'n_filaments_xy':5,
                           'n_gamma':5,
                           'timestep_divider':20,
-                          'dt':2e-8,
+                          'dt':1e-8,
                           'calc_mode':'cpu', # cpu_unparallel
                           'load_traj':load_traj,
                           'save_traj':save_traj,
@@ -796,12 +797,10 @@ if calculate_zones:
                           'save_plots': save_plots,
                           'create_table': False}
         
-        t1 = time.time()
-        
-        traj_fat_beam = hb.fatbeam_calc(*fatbeam_args, **fatbeam_kwargs)
-        
-        t2 = time.time()
-        print(f'Fatbeam executed: {round(t2-t1, 2)} sec')
+        with Timer() as time:
+            traj_fat_beam = hb.fatbeam_calc(*fatbeam_args, **fatbeam_kwargs)
+
+        print(f'Fatbeam executed: {round(time.elapsed, 2)} sec')
         
         
         
