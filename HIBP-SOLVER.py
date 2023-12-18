@@ -760,24 +760,40 @@ if calculate_zones:
                         Btor,
                         Ipl]
         
+        mode = 'load' # 'load' and 'save' modes
+        if mode == 'save':
+            load_traj = False
+            save_traj = True
+            plot_trajs = True
+            rescale_plots = False
+            close_plots = True
+            save_plots = True
+        elif mode == 'load':
+            load_traj = True
+            save_traj = False
+            plot_trajs = True
+            rescale_plots = False
+            close_plots = False
+            save_plots = False
+        
         fatbeam_kwargs = {'Ebeam_orig':'260',
                           'UA2_orig':'10',
                           'target':'slit',
                           'slits_orig':'4',
-                          'd_beam':0.02,
+                          'd_beam':0.002,
                           'foc_len':50,
                           'n_filaments_xy':5,
                           'n_gamma':5,
                           'timestep_divider':20,
                           'dt':2e-8,
                           'calc_mode':'cpu', # cpu_unparallel
-                          'load_traj':True,
-                          'save_traj':False,
+                          'load_traj':load_traj,
+                          'save_traj':save_traj,
                           'path_orig': os.path.join('fatbeam', 'results', 'fix_cylinder'),
-                          'plot_trajs': False,
-                          'rescale_plots': False,
-                          'close_plots': True,
-                          'save_plots': False,
+                          'plot_trajs': plot_trajs,
+                          'rescale_plots': rescale_plots,
+                          'close_plots': close_plots,
+                          'save_plots': save_plots,
                           'create_table': False}
         
         t1 = time.time()

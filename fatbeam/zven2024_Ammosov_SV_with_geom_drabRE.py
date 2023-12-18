@@ -24,7 +24,7 @@ plot_sv = False
 plot_lines = True
 plot_dots = True
 plot_geom = True
-viewpoint='iz' # 'start', 'iz', 'slits'
+viewpoint='start' # 'start', 'iz', 'slits'
 
 # Set font properties
 font = {'fontname': 'Times New Roman'}
