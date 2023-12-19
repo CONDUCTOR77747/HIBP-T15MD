@@ -761,7 +761,7 @@ if calculate_zones:
                         Btor,
                         Ipl]
         
-        mode = 'load' # 'load' and 'save' modes
+        mode = 'save' # 'load' and 'save' modes
         if mode == 'save':
             load_traj = False
             save_traj = True
@@ -777,16 +777,16 @@ if calculate_zones:
             close_plots = False
             save_plots = False
         
-        fatbeam_kwargs = {'Ebeam_orig':'240',
+        fatbeam_kwargs = {'Ebeam_orig':'260',
                           'UA2_orig':'10',
                           'target':'slit',
-                          'slits_orig':'3',
-                          'd_beam':0.002,
+                          'slits_orig':'4',
+                          'd_beam':0.02,
                           'foc_len':50,
                           'n_filaments_xy':5,
                           'n_gamma':5,
                           'timestep_divider':20,
-                          'dt':2e-7,
+                          'dt':2e-8,
                           'calc_mode':'cpu', # cpu_unparallel
                           'load_traj':load_traj,
                           'save_traj':save_traj,

@@ -90,12 +90,10 @@ class Traj():
         self.B_out_of_bounds = False
         self._B_out_of_bounds_debug_info = None
 
-        # multislit:
+        # fatbeam:
         self.fan_to_slits = []
         self.RV_sec_toslits = []
         self.ion_zones = []
-        
-        # fatbeam
         self.I0 = None # Initial Trajectory current
 
         self.log = []

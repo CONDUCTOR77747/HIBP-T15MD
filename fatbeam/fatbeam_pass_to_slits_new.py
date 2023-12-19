@@ -31,12 +31,10 @@ def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
     '''
     pass trajectories to slits and save secondaries which get into slits
     '''
-    tr.dt1 = dt/4
-    tr.dt2 = dt
-    k = tr.q / tr.m
     # find the number of slits
     n_slits = geom.plates_dict['an'].slits_edges.shape[0]
     tr.add_slits(n_slits)
+    
     # find slits position
     if target == 'slit':
         r_slits = geom.plates_dict['an'].slits_edges
@@ -61,16 +59,19 @@ def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
     
     if print_log:
         print('\nStarting precise fan calculation')
+        
     # divide the timestep
     tr.dt1 = dt/timestep_divider
     tr.dt2 = dt
+    k = tr.q / tr.m
+    
     # number of steps during new fan calculation
     n_steps = timestep_divider * (len(sec_ind))
+    
     # list for new trajectories
     fan_list = []
+    
     # take the point to start fan calculation
-    # RV_old = tr.Fan[sec_ind[0]-1][0]
-    # RV_old = tr.RV_prim[sec_ind[0]]
     RV_old = tr.RV_prim[sec_ind[0]]
     RV_old = np.array([RV_old])
     RV_new = RV_old
