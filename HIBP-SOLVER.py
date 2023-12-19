@@ -761,7 +761,7 @@ if calculate_zones:
                         Btor,
                         Ipl]
         
-        mode = 'save' # 'load' and 'save' modes
+        mode = 'load' # 'load' and 'save' modes
         if mode == 'save':
             load_traj = False
             save_traj = True
