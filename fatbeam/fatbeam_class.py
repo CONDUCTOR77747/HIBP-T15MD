@@ -30,7 +30,7 @@ class fatbeam():
         self.Btor = Btor
         self.Ipl = Ipl
         
-    def calc(self,  d_beam, foc_len, dt=2e-8, filaments=10, slits=[3], target='slits'):
+    def calc(self,  d_beam, foc_len, dt=2e-8, filaments=7, slits=[3], target='slits'):
         timestep_divider=20
     
     def save(self, dirname):
@@ -41,31 +41,43 @@ class fatbeam():
     
     
     
-    def _set_new_RV0s(self, tr, d_beam, foc_len, filaments):
+    def _set_new_RV0s(self, tr, d_beam, foc_len, filaments=7):
+        """
+        
+
+        Parameters
+        ----------
+        tr : hibplib.Traj
+            Optimized single Trajectory.
+        d_beam : float
+            beam diameter [m].
+        foc_len : float
+            focal length of the beam [m].
+        filaments : int
+            Amount of dots along vertical and horizontal diameters of rectangle grid.
+
+        Returns
+        -------
+        tr_fat_new_rv0 : list[hibplib.Traj]
+            List of Trajectries with new RV0 setted according to grid.
+
+        """
         tr_rots = []
         tr_fat_buff_list = [] # list contains trajectories with new RV0
-        r0 = tr.RV0[0, :3]
-        v0_abs = np.linalg.norm(tr.RV0[0, 3:])
-        n = 7 # Amount of dots along vertical and horizontal diameters of rectangle grid.
         
-        grid = create_disk_grid_gauss([0, 0], d_beam/2., n, gaus2d)
+        r0 = tr.RV0[0, :3] # starting position coordinates
+        v0_abs = np.linalg.norm(tr.RV0[0, 3:]) # absolute velocity
+        
+        grid = create_disk_grid_gauss([0, 0], d_beam/2., filaments, gaus2d)
         
         n_filaments_xy = len(grid[0])
         
         for i in range(n_filaments_xy):
-        # skip center traj
-            # if abs(i - (n_filaments_xy-1)/2) < 1e-6 and skip_center_traj:
-            #     continue
-            
+
             # beam convergence angle
             alpha_conv = np.arctan((i - (n_filaments_xy-1)/2) *
                                 (d_beam/(n_filaments_xy-1)) / foc_len)
-            # alpha_conv = 0
             
-            # set coords and velocity at the center of coord system
-            # x = 0.0
-            # y = -(i - (n_filaments_xy-1)/2) * (d_beam/(n_filaments_xy-1))
-            # z = 0.0
             
             r = [grid[0][i], grid[1][i], 0]
             
@@ -84,13 +96,9 @@ class fatbeam():
             tr_fat = copy.deepcopy(tr)
             tr_fat.I0 = grid[2][i]
             tr_fat.RV0[0, :] = np.hstack([r_rot, v_rot])
-            tr_rots.append(r_rot)
             tr_fat_buff_list.append(tr_fat)
             
-            # if abs(y) < 1e-6:
-            #     break
-            
-        return tr_fat_buff_list, tr_rots
+        return tr_fat_new_rv0
 
  # fatbeam_kwargs = {'Ebeam_orig':'260',
  #                   'UA2_orig':'10',
@@ -113,6 +121,9 @@ class fatbeam():
  #                   'create_table': False}
 
 class grid():
+    
+    def __call__(self, ):
+        
     
     def _create_disk_grid(self, c, r, n):
         """

@@ -497,6 +497,10 @@ class Traj():
         index_X, index_Y = axes_dict[axes]
         for i in self.Fan:
             ax.plot(i[:, index_X], i[:, index_Y], color=color)
+    
+    @property
+    def initial_data(self):
+        return self.q, self.m, self.Ebeam, self.r0, self.alpha, self.beta, self.U, self.dt
 
 # %% new traj functions !!! TO BE TESTED !!!
     # def _plot_fan(self, ax, axes='XY', color='r', indexces=):
