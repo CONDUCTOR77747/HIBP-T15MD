@@ -25,7 +25,7 @@ from fatbeam.fatbeam_grid import fatbeam_set_new_RV0s2
 
 #%%
 
-def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=10,
+def pass_to_slits_new(tr, dt, E, B, geom, target='slit', timestep_divider=10,
                   slits=range(7), no_intersect=True, no_out_of_bounds=True,
                   print_log=True):
     '''

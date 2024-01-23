@@ -5,23 +5,26 @@ Created on Tue Nov 28 17:58:35 2023
 @author: ammosov_yam
 """
 
-import hibplib
-import hibpcalc
+import os
+import copy
 import numpy as np
 
-class fatbeam(): 
+#local imports
+import hibplib as hb
+import hibpcalc as hc
+import hibpcalc.geomfunc as gf
+
+class Fatbeam(): 
     
-    fatbeam: hibplib.Traj
+    fatbeam: hb.Traj
     E: dict
-    B: hibpcalc.fields.FieldInterpolator
-    geom: hibplib.Geometry
+    B: hc.fields.FieldInterpolator
+    geom: hb.Geometry
     Btor: float
     Ipl: float
     
-    
-    
-    def __init__(self, traj: hibplib.Traj, E: dict, 
-                 B: hibpcalc.fields.FieldInterpolator, geom: hibplib.Geometry,
+    def __init__(self, traj: hb.Traj, E: dict, 
+                 B: hc.fields.FieldInterpolator, geom: hb.Geometry,
                 Btor: float, Ipl: float) -> None:
         self.fatbeam = traj
         self.E = E
@@ -33,50 +36,48 @@ class fatbeam():
     def calc(self,  d_beam, foc_len, dt=2e-8, filaments=7, slits=[3], target='slits'):
         timestep_divider=20
     
-    def save(self, dirname):
+    def save(self, dirname: str) -> None:
         pass
     
     def plot(self):
         pass
     
-    
-    
-    def _set_new_RV0s(self, tr, d_beam, foc_len, filaments=7):
+    def _set_new_RV0s(self, tr, d_beam, foc_len, Grid, filaments=7):
         """
-        
 
         Parameters
         ----------
-        tr : hibplib.Traj
+        tr : hb.Traj
             Optimized single Trajectory.
         d_beam : float
             beam diameter [m].
         foc_len : float
             focal length of the beam [m].
+        Grid : Class
+            Class for creation grid. For example Rectangular Gauss Grid.
         filaments : int
             Amount of dots along vertical and horizontal diameters of rectangle grid.
 
         Returns
         -------
-        tr_fat_new_rv0 : list[hibplib.Traj]
+        tr_fat_new_rv0 : list[hb.Traj]
             List of Trajectries with new RV0 setted according to grid.
 
         """
-        tr_rots = []
-        tr_fat_buff_list = [] # list contains trajectories with new RV0
+
+        tr_fat_new_rv0 = [] # list contains trajectories with new RV0
         
         r0 = tr.RV0[0, :3] # starting position coordinates
         v0_abs = np.linalg.norm(tr.RV0[0, 3:]) # absolute velocity
         
-        grid = create_disk_grid_gauss([0, 0], d_beam/2., filaments, gaus2d)
+        grid = Grid([0, 0], d_beam/2., filaments)
         
-        n_filaments_xy = len(grid[0])
-        
-        for i in range(n_filaments_xy):
+        n_filaments = len(grid[0])
+        for i in range(n_filaments):
 
             # beam convergence angle
-            alpha_conv = np.arctan((i - (n_filaments_xy-1)/2) *
-                                (d_beam/(n_filaments_xy-1)) / foc_len)
+            alpha_conv = np.arctan((i - (n_filaments-1)/2) *
+                                (d_beam/(n_filaments-1)) / foc_len)
             
             
             r = [grid[0][i], grid[1][i], 0]
@@ -93,10 +94,10 @@ class fatbeam():
             v_rot = gf.rotate(v_rot, axis=(0, 0, 1), deg=tr.alpha)
             v_rot = gf.rotate(v_rot, axis=(0, 1, 0), deg=tr.beta)
             
-            tr_fat = copy.deepcopy(tr)
-            tr_fat.I0 = grid[2][i]
-            tr_fat.RV0[0, :] = np.hstack([r_rot, v_rot])
-            tr_fat_buff_list.append(tr_fat)
+            new_tr = hb.Traj(tr.q, tr.m, tr.Ebeam, r0, tr.alpha, tr.beta, tr.U)
+            new_tr.I0 = grid[2][i] # set I0 initial current distribution
+            new_tr.RV0[0, :] = np.hstack([r_rot, v_rot])
+            tr_fat_new_rv0.append(new_tr)
             
         return tr_fat_new_rv0
 
@@ -106,7 +107,7 @@ class fatbeam():
  #                   'slits_orig':'4',
  #                   'd_beam':0.02,
  #                   'foc_len':50,
- #                   'n_filaments_xy':5,
+ #                   'n_filaments':5,
  #                   'n_gamma':5,
  #                   'timestep_divider':20,
  #                   'dt':2e-8,
@@ -120,63 +121,12 @@ class fatbeam():
  #                   'save_plots': save_plots,
  #                   'create_table': False}
 
-class grid():
+class Grid():
     
-    def __call__(self, ):
-        
+    def _gauss2d(self, x=0, y=0, mx=0, my=0, sx=0.003, sy=0.003, a=1, pad=0):
+        return a * np.exp(-((x - mx)**2. / (2. * sx**2.) + (y - my)**2. / (2. * sy**2.))) + pad
     
-    def _create_disk_grid(self, c, r, n):
-        """
-        
-        Creates 2D rectangle grid of points inside circle with raidus r.
-
-        Parameters
-        ----------
-        c : list of float
-            Circle central dot. Example: c = [0, 0].
-        r : float
-            Radius of a circle.
-        n : int
-            Amount of dots along vertical and horizontal diameters of rectangle grid.
-            Odd values are preferred.
-
-        Returns
-        -------
-        grid : list of two lists of floats - [[x values], [y values]]
-            list with x and y values of grid.
-
-        """
-        
-        # only 1 central dot
-        if n == 1:
-            return [[c[0]], [c[1]]]
-        
-        grid = [[],[]]
-        
-        # set grid boundary points
-        left_point  = c[0] - r
-        right_point = c[0] + r
-        down_point  = c[1] - r
-        up_point    = c[1] + r
-        
-        # create horizontal and vertical diameters of rectangle grid
-        x = np.linspace(left_point, right_point, int(n))
-        y = np.linspace(down_point, up_point, int(n))
-        
-        # create full rectangle grid of points
-        X, Y = np.meshgrid(x, y)
-        positions = np.vstack([X.ravel(), Y.ravel()])
-        
-        # take points, which inside the circle with radius r
-        for i in range(len(positions[0])):
-            point = [positions[0][i], positions[1][i]]
-            if np.linalg.norm([c, point]) <= r:
-                grid[0].append(point[0])
-                grid[1].append(point[1])
-        
-        return grid
-    
-    def _create_disk_grid_gauss(self, c0, r, n, profile):
+    def init(self, c0, r, n, profile=_gauss2d):
         """
         
         Creates 2D rectangle grid of points inside circle with raidus r.
@@ -191,8 +141,8 @@ class grid():
             Amount of dots along vertical and horizontal diameters of rectangle grid.
             Odd values are preferred.
         profile : function
-            Function with given distribution.    
-            For example Gauss function.
+            Function with given distribution profile.    
+            Gauss function by default.
             
         Returns
         -------
@@ -237,11 +187,8 @@ class grid():
         
         return grid
 
-    def _gaus2d(self, x=0, y=0, mx=0, my=0, sx=0.003, sy=0.003, a=1, pad=0):
-        return a * np.exp(-((x - mx)**2. / (2. * sx**2.) + (y - my)**2. / (2. * sy**2.))) + pad
-
 if __name__=='__main__':
     
-    fb = fatbeam(traj_list_optimized[0], E, B, geomT15, Btor, Ipl)
+    fb = Fatbeam(traj_list_optimized[0], E, B, geomT15, Btor, Ipl)
     fb.calc()
-    fb.save('fatbeam/results/new')
+    fb.save(os.path.join('fatbeam', 'results', 'new'))

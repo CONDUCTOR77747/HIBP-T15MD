@@ -790,7 +790,7 @@ if calculate_zones:
                           'calc_mode':'cpu', # cpu_unparallel
                           'load_traj':load_traj,
                           'save_traj':save_traj,
-                          'path_orig': os.path.join('fatbeam', 'results', 'fix_cylinder'),
+                          'path_orig': os.path.join('fatbeam', 'results', '2024'),
                           'plot_trajs': plot_trajs,
                           'rescale_plots': rescale_plots,
                           'close_plots': close_plots,
