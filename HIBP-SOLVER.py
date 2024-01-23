@@ -787,7 +787,7 @@ if calculate_zones:
                           'n_gamma':5,
                           'timestep_divider':20,
                           'dt':2e-8,
-                          'calc_mode':'cpu', # cpu_unparallel
+                          'calc_mode':'cpu_unparallel', # cpu_unparallel
                           'load_traj':load_traj,
                           'save_traj':save_traj,
                           'path_orig': os.path.join('fatbeam', 'results', '2024'),
