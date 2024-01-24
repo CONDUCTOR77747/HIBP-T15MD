@@ -340,8 +340,8 @@ if __name__ == '__main__':
         return a * np.exp(-((x - mx)**2. / (2. * s**2.))) + pad
     
     # Main plot 3D Hat
-    # grid2 = create_disk_grid_gauss(c, r, n, gaus2d)
-    # create_3d_plot_my(c, r, grid2)
+    grid2 = create_disk_grid_gauss(c, r, n, gaus2d)
+    create_3d_plot_my(c, r, grid2)
     
     # 1D Gauss plot
     # fig, ax = plt.subplots()
