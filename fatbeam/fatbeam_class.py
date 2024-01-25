@@ -18,7 +18,7 @@ import hibpcalc.geomfunc as gf
 class Fatbeam: 
     
     traj: hb.Traj # initial trajectory
-    fatbeam: list[hb.Traj] # list of filaments
+    filaments: list[hb.Traj] # list of filaments. Filament: hb.Traj
     E: dict
     B: hc.fields.FieldInterpolator
     geom: hb.Geometry
@@ -30,7 +30,7 @@ class Fatbeam:
                 Btor: float, Ipl: float) -> None:
 
         self.traj = traj
-        self.fatbeam = []
+        self.filaments = []
         self.E = E
         self.B = B
         self.geom = geom
@@ -113,7 +113,7 @@ class Fatbeam:
         self.grid = grid
         return grid
     
-    def _set_new_RV0s(self, d_beam, foc_len, filaments=7):
+    def _set_new_RV0s(self, d_beam, foc_len, n=7):
         
         """
 
@@ -127,7 +127,7 @@ class Fatbeam:
             focal length of the beam [m].
         Grid : Class
             Class for creation grid. For example Rectangular Gauss Grid.
-        filaments : int
+        n : int
             Amount of dots along vertical and horizontal diameters of rectangle grid.
 
         Returns
@@ -136,10 +136,10 @@ class Fatbeam:
             List of Trajectries with new RV0 setted according to grid.
 
         """
-        grid = self.create_grid([0, 0], d_beam/2., filaments, self._gauss2d)
+        grid = self.create_grid([0, 0], d_beam/2., n, self._gauss2d)
         
         tr = self.traj # initial trajectory (thin, one E, one U)
-        tr_fat_new_rv0 = self.fatbeam # list contains trajectories with new RV0
+        tr_fat_new_rv0 = self.filaments # list contains trajectories with new RV0
         
         r0 = tr.RV0[0, :3] # starting position coordinates
         v0_abs = np.linalg.norm(tr.RV0[0, 3:]) # absolute velocity
@@ -166,7 +166,9 @@ class Fatbeam:
             v_rot = gf.rotate(v_rot, axis=(0, 0, 1), deg=tr.alpha)
             v_rot = gf.rotate(v_rot, axis=(0, 1, 0), deg=tr.beta)
             
-            new_tr = hb.Traj(tr.q, tr.m, tr.Ebeam, r0, tr.alpha, tr.beta, tr.U, dt=3e-10)
+            new_tr = hb.Traj(tr.q, tr.m, tr.Ebeam, r0, tr.alpha, tr.beta, tr.U)
+            new_tr.dt1 = 2e-8 #3e-10 # dt for passing primary trajectory
+            new_tr.dt2 = 2e-8 #3e-8 # dt for passing secondary trajectories
             new_tr.I0 = grid[2][i] # set I0 initial current distribution
             new_tr.RV0[0, :] = np.hstack([r_rot, v_rot])
             tr_fat_new_rv0.append(new_tr)

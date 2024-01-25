@@ -21,6 +21,8 @@ import hibpplotlib as hbplot
 import define_geometry as defgeom
 from contexttimer import Timer
 
+import fatbeam.fatbeam_class as fb
+
 # %% additional functions
 
 
@@ -78,15 +80,15 @@ def calc_shift(V, plates, adaptive_aim, func=linear_at_zero(2.0)):
 
 
 # %% set flags
-optimizeB2 = False
-optimizeA3B3 = False
+optimizeB2 = True
+optimizeA3B3 = True
 pass2AN = False
-calculate_zones = True
+calculate_zones = False
 save_radref = False
-save_primary = False
-save_sec = False
+save_primary = True
+save_sec = True
 pass2aim_only = False
-load_traj_from_file = True
+load_traj_from_file = False
 save_grids_and_angles = False
 adaptive_aim = False
 debag = False
@@ -345,14 +347,14 @@ if Btor == 2.0:
                                      49.5,  31.0, -20.0),  # 35
                      ]
 # timestep [sec]
-dt = 0.2e-7  # 0.7e-7
+dt = 3e-10  # 0.7e-7
 
 # probing ion charge and mass
 q = 1.602176634e-19  # electron charge [Co]
 m_ion = 204.3833 * 1.6605e-27  # Tl ion mass [kg]
 
 # beam energy
-energies = {'work': (240., 240., 20.), 'test': (300., 300., 20.)}
+energies = {'work': (100., 100., 20.), 'test': (300., 300., 20.)}
 
 Emin, Emax, dEbeam = energies[regime]
 
@@ -375,7 +377,7 @@ for beamline_num in beamline_indexes:
     traj2load = ['Btor {}'.format(Btor) + 'beamline {}'.format(beamline_num)]
     # %% set voltages
     # UA2 voltages
-    UU_A2 = {'work': (-10., 50., 5.), 'test': (-10., 50., 2.)}
+    UU_A2 = {'work': (6., 6., 5.), 'test': (-10., 50., 2.)}
     # 32., 32., 2. #12., 12., 2.  #0., 34., 2.  # -3, 33., 3.  # -3., 30., 3.
     UA2min, UA2max, dUA2 = UU_A2[regime]
     NA2_points = 10
@@ -587,7 +589,7 @@ for beamline_num in beamline_indexes:
 
     # %% Save traj list
         if save_primary:
-            hb.save_traj_list(traj_list_passed, Btor, Ipl, beamline_num)
+            hb.save_traj_list(traj_list_passed, Btor, Ipl, beamline_num, dirname='output_test')
 
     # %% Additional plots
         if save_grids_and_angles:
@@ -721,7 +723,7 @@ for beamline_num in beamline_indexes:
 # %% Save traj list
     if save_sec:
         hb.save_traj_list(traj_list_a3b3, Btor, Ipl,
-                          beamline_num, dirname='output/sec_opt')
+                          beamline_num, dirname='output_test/sec_opt')
 
 # %% Pass to ANALYZER
 if pass2AN:
@@ -737,70 +739,98 @@ if pass2AN:
                     tmax=9e-5, eps_xy=eps_xy, eps_z=eps_z)
         traj_list_an.append(tr)
         
-#%% fatbeam calculation
-if calculate_zones:
+# #%% fatbeam calculation
+# if calculate_zones:
     
     
-    # new_path = 'filaments_test'
-    # filaments = np.arange(3, 21, 3)
-    # n_gammas = np.arange(3, 21, 3)
-    # print(f'Filaments: {filaments[0]}-{filaments[-1]}')
-    # print(f'Filaments: {n_gammas[0]}-{n_gammas[-1]}')
-    # print(f'Total operations: {len(filaments)*len(n_gammas)}')
-    # for fil in filaments:
-    #     for ng in n_gammas:
+#     # new_path = 'filaments_test'
+#     # filaments = np.arange(3, 21, 3)
+#     # n_gammas = np.arange(3, 21, 3)
+#     # print(f'Filaments: {filaments[0]}-{filaments[-1]}')
+#     # print(f'Filaments: {n_gammas[0]}-{n_gammas[-1]}')
+#     # print(f'Total operations: {len(filaments)*len(n_gammas)}')
+#     # for fil in filaments:
+#     #     for ng in n_gammas:
             
-        # using optimized trajectories
-        traj_list_optimized = copy.deepcopy(traj_list_passed)
+#         # using optimized trajectories
+#         traj_list_optimized = copy.deepcopy(traj_list_passed)
     
-        # fatbeam_calc function parameters
-        fatbeam_args = [traj_list_optimized,
-                        E,
-                        B,
-                        geomT15,
-                        Btor,
-                        Ipl]
+#         # fatbeam_calc function parameters
+#         fatbeam_args = [traj_list_optimized,
+#                         E,
+#                         B,
+#                         geomT15,
+#                         Btor,
+#                         Ipl]
         
-        mode = 'save' # 'load' and 'save' modes
-        if mode == 'save':
-            load_traj = False
-            save_traj = True
-            plot_trajs = True
-            rescale_plots = False
-            close_plots = True
-            save_plots = True
-        elif mode == 'load':
-            load_traj = True
-            save_traj = False
-            plot_trajs = True
-            rescale_plots = False
-            close_plots = False
-            save_plots = False
+#         mode = 'save' # 'load' and 'save' modes
+#         if mode == 'save':
+#             load_traj = False
+#             save_traj = True
+#             plot_trajs = True
+#             rescale_plots = False
+#             close_plots = True
+#             save_plots = True
+#         elif mode == 'load':
+#             load_traj = True
+#             save_traj = False
+#             plot_trajs = True
+#             rescale_plots = False
+#             close_plots = False
+#             save_plots = False
         
-        fatbeam_kwargs = {'Ebeam_orig':'260',
-                          'UA2_orig':'10',
-                          'target':'slit',
-                          'slits_orig':'4',
-                          'd_beam':0.02,
-                          'foc_len':50,
-                          'n_filaments_xy':5,
-                          'n_gamma':5,
-                          'timestep_divider':20,
-                          'dt':2e-8,
-                          'calc_mode':'cpu_unparallel', # cpu_unparallel
-                          'load_traj':load_traj,
-                          'save_traj':save_traj,
-                          'path_orig': os.path.join('fatbeam', 'results', '2024'),
-                          'plot_trajs': plot_trajs,
-                          'rescale_plots': rescale_plots,
-                          'close_plots': close_plots,
-                          'save_plots': save_plots,
-                          'create_table': False}
+#         fatbeam_kwargs = {'Ebeam_orig':'260',
+#                           'UA2_orig':'10',
+#                           'target':'slit',
+#                           'slits_orig':'4',
+#                           'd_beam':0.02,
+#                           'foc_len':50,
+#                           'n_filaments_xy':5,
+#                           'n_gamma':5,
+#                           'timestep_divider':20,
+#                           'dt':2e-8,
+#                           'calc_mode':'cpu_unparallel', # cpu_unparallel
+#                           'load_traj':load_traj,
+#                           'save_traj':save_traj,
+#                           'path_orig': os.path.join('fatbeam', 'results', '2024'),
+#                           'plot_trajs': plot_trajs,
+#                           'rescale_plots': rescale_plots,
+#                           'close_plots': close_plots,
+#                           'save_plots': save_plots,
+#                           'create_table': False}
         
-        with Timer() as time:
-            traj_fat_beam = hb.fatbeam_calc(*fatbeam_args, **fatbeam_kwargs)
+#         with Timer() as time:
+#             traj_fat_beam = hb.fatbeam_calc(*fatbeam_args, **fatbeam_kwargs)
 
-        print(f'Fatbeam executed: {round(time.elapsed, 2)} sec')
+#         print(f'Fatbeam executed: {round(time.elapsed, 2)} sec')
         
-        
-        
+#%%
+
+# def plot_fan_on_slits(geomT15):
+#     geomT15.slits
+
+# using optimized trajectories
+# traj_list_optimized = copy.deepcopy(traj_list_passed)
+# hbplot.plot_fan(traj_list_optimized, geomT15, 240, 14, Btor, Ipl, plot_analyzer=True)
+
+#%%
+traj_list_optimized = copy.deepcopy(traj_list_passed)
+fatbeam = fb.Fatbeam(traj_list_optimized[0], E, B, geomT15, Btor, Ipl)
+fatbeam._set_new_RV0s(0.02, 50)
+fatbeam.plot3d()
+r_aim = geomT15.r_dict['an']
+
+fatbeam.filaments[0].pass_fan(r_aim, E, B, geomT15, no_intersect=True, no_out_of_bounds=True)
+
+hbplot.plot_fan([fatbeam.filaments[0]], geomT15, 100, 6, Btor, Ipl, plot_traj=True,
+              plot_last_points=True, plot_analyzer=True, plot_all=False,
+              full_primary=False)
+
+# fatbeam.traj.pass_fan(r_aim, E, B, geomT15, no_intersect=True, no_out_of_bounds=True)
+
+# hbplot.plot_fan([fatbeam.traj], geomT15, 100, 6, Btor, Ipl, plot_traj=True,
+#              plot_last_points=True, plot_analyzer=True, plot_all=False,
+#              full_primary=False)
+
+# hbplot.plot_traj([fatbeam.fatbeam[0]], geomT15, 100, 6, Btor, Ipl, full_primary=False,
+#               plot_analyzer=True, subplots_vertical=False, scale=5)

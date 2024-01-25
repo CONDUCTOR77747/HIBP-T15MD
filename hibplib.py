@@ -15,6 +15,7 @@ from matplotlib import path
 import matplotlib.pyplot as plt
 from joblib import Parallel, delayed # joblib=1.3.2; python>=3.11.6;
 from matplotlib.patches import Rectangle
+from tqdm import tqdm
 
 import hibpplotlib as hbplot
 import optimizers
@@ -187,6 +188,9 @@ class Traj():
         with accuracy eps
         RV0 : initial position and velocity
         '''
+        
+        print('still working!')
+        
         # print('Passing secondary trajectory')
         self.IsAimXY = False
         self.IsAimZ = False
@@ -305,7 +309,7 @@ class Traj():
     def pass_fan(self, r_aim, E_interp, B_interp, geom,
                  stop_plane_n=np.array([1., 0., 0.]), eps_xy=1e-3, eps_z=1e-3,
                  no_intersect=False, no_out_of_bounds=False,
-                 invisible_wall_x=5.5):
+                 invisible_wall_x=5.5, fan_step_divider=100):
         '''
         passing fan from initial point self.RV0
         '''
@@ -322,8 +326,9 @@ class Traj():
 
         # check eliptical radius of particle:
         # 1.5 m - major radius of a torus, elon - size along Y
-        mask = np.sqrt((self.RV_prim[:, 0] - geom.R)**2 +
-                       (self.RV_prim[:, 1] / geom.elon)**2) <= geom.r_plasma
+        mask = [((np.sqrt((self.RV_prim[i, 0] - geom.R)**2 +
+                       (self.RV_prim[i, 1] / geom.elon)**2) <= geom.r_plasma)
+                 and (i%fan_step_divider)) for i in range(len(self.RV_prim))]
 
         self.tag_prim[mask] = 11
 
