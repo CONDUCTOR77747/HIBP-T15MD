@@ -189,7 +189,7 @@ class Traj():
         RV0 : initial position and velocity
         '''
         
-        print('still working!')
+        # print('pass sec is working!') # !!!
         
         # print('Passing secondary trajectory')
         self.IsAimXY = False
@@ -309,7 +309,7 @@ class Traj():
     def pass_fan(self, r_aim, E_interp, B_interp, geom,
                  stop_plane_n=np.array([1., 0., 0.]), eps_xy=1e-3, eps_z=1e-3,
                  no_intersect=False, no_out_of_bounds=False,
-                 invisible_wall_x=5.5, fan_step_divider=100):
+                 invisible_wall_x=5.5, fan_step_divider=1):
         '''
         passing fan from initial point self.RV0
         '''
@@ -326,9 +326,13 @@ class Traj():
 
         # check eliptical radius of particle:
         # 1.5 m - major radius of a torus, elon - size along Y
-        mask = [((np.sqrt((self.RV_prim[i, 0] - geom.R)**2 +
-                       (self.RV_prim[i, 1] / geom.elon)**2) <= geom.r_plasma)
-                 and (i%fan_step_divider)) for i in range(len(self.RV_prim))]
+        mask = np.sqrt((self.RV_prim[:, 0] - geom.R)**2 +
+                       (self.RV_prim[:, 1] / geom.elon)**2) <= geom.r_plasma
+        
+        # new mask Oleg Edition
+        # mask = [((np.sqrt((self.RV_prim[i, 0] - geom.R)**2 +
+        #                (self.RV_prim[i, 1] / geom.elon)**2) <= geom.r_plasma)
+        #          and (i%fan_step_divider)) for i in range(len(self.RV_prim))]
 
         self.tag_prim[mask] = 11
 
