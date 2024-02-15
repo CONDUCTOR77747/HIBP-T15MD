@@ -747,17 +747,15 @@ fatbeam._set_new_RV0s(0.02, 50, n=7)
 # fatbeam.plot3d()
 r_aim = geomT15.r_dict['r0'] # geomT15.r_dict['an']
 
-fatbeam.filaments[0].dt1 = 3e-10
+fatbeam.filaments[0].dt1 = 3e-8
 
-fatbeam.filaments[0].pass_prim(E, B, geomT15, tmax=1e-5, invisible_wall_x=5.5, print_log=True)
+fatbeam.filaments[0].pass_prim(E, B, geomT15, tmax=1e-5, invisible_wall_x=5.5, 
+                               print_log=True)
 
-#3e-10
-
-fatbeam_passed = fatbeam.pass_to_slits(fatbeam.filaments[0], 3e-8, E, B, geomT15, target='slit', timestep_divider=1,
-                  slits=[3], any_traj=True, print_log=True)
+fatbeam_passed = fatbeam.pass_to_slits(fatbeam.filaments[0], 3e-8, E, B, geomT15, 
+                  target='slit', timestep_divider=1, slits=[3], any_traj=True, 
+                  print_log=True)
 
 fatbeam_passed_list = []
-
 fatbeam_passed_list.append(fatbeam_passed)
-
 hbplot.plot_fatbeam(fatbeam_passed_list, geomT15, Btor, Ipl, n_slit=3, scale=3)

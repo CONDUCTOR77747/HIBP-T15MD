@@ -212,7 +212,7 @@ class Fatbeam:
         plt.show()
         
     @staticmethod
-    def pass_to_slits(tr, dt, E, B, geom, target='slit', timestep_divider=1,
+    def pass_to_slits(tr, dt, E, B, geom, target='slit', step_on_primary=1,timestep_divider=1,
                       slits=range(7), any_traj=False, print_log=True):
         '''
         pass trajectories to slits and save secondaries which get into slits
@@ -242,27 +242,24 @@ class Fatbeam:
         # find index of primary trajectory point where secondary starts
         # index = np.nanargmin(np.linalg.norm(tr.RV_prim[:, :3] -
         #                                     tr.RV_sec[0, :3], axis=1))
-        sec_ind = tr.RV_prim #range(index-2, index+2)
-        # sec_ind = len(tr.RV_prim)
+        sec_ind = tr.RV_prim #range(index-2, index+2) #
         
         if print_log:
             print('\nStarting precise fan calculation')
             
         # divide the timestep
-        tr.dt1 = dt/timestep_divider
+        tr.dt1 = dt
         tr.dt2 = dt
         k = tr.q / tr.m
         
+        # for i in range(len(tr.RV_prim)):
+        #     print("check", tr.RV_prim[i, 0], tr.RV_prim[i, 1])
+        
         # number of steps during new fan calculation
-        n_steps = timestep_divider * len(sec_ind)
+        n_steps = len(sec_ind)
         
         # list for new trajectories
         fan_list = []
-        
-        # check eliptical radius of particle:
-        # 1.5 m - major radius of a torus, elon - size along Y
-        mask = np.sqrt((tr.RV_prim[:, 0] - geom.R)**2 +
-                       (tr.RV_prim[:, 1] / geom.elon)**2) <= geom.r_plasma
         
         # take the point to start fan calculation
         # RV_old = tr.RV_prim[sec_ind[0]]
@@ -271,12 +268,21 @@ class Fatbeam:
         RV_new = RV_old
         
         inside_slits_poly = False
-        for i_steps in tqdm(range(1, n_steps)):
+        for i_steps in tqdm(range(1, n_steps, step_on_primary)):
+            
+            # geometry mask
+            # check eliptical radius of particle:
+            # 1.5 m - major radius of a torus, elon - size along Y
+            if np.sqrt((tr.RV_prim[i_steps, 0] - geom.R)**2 + 
+                        (tr.RV_prim[i_steps, 1] / geom.elon)**2) > geom.r_plasma:
+                # print(tr.RV_prim[i_steps, 0], tr.RV_prim[i_steps, 1], 'skipped', f'i={i_steps}')
+                continue
+            
             # pass new secondary trajectory
             tr.pass_sec(RV_new, rs, E, B, geom,
                         stop_plane_n=slit_plane_n, tmax=9e-5,
                         eps_xy=1e-3, eps_z=1, print_log=False)
-    
+            
             # make a step on primary trajectory
             r = RV_old[0, :3]
             
@@ -285,12 +291,13 @@ class Fatbeam:
             B_local = B(r)
             if np.isnan(B_local).any():
                 if print_log:
-                    print('Btor is nan, r = %s' % str(r))
+                    print(f'Btor is nan, r = {r}')
                 break
     
             # runge-kutta step
-            # RV_new = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
+            RV_new2 = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
             RV_new = np.array([tr.RV_prim[i_steps]])
+            print("compare", RV_new, RV_new2, sep='\n')
             RV_old = RV_new
     
             # check intersection with slits polygon
