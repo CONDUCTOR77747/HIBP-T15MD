@@ -747,11 +747,11 @@ fatbeam = fb.Fatbeam(traj_list_optimized[0], E, B, geomT15, Btor, Ipl, dt1=3e-10
 fatbeam._set_new_RV0s(0.02, 50, n=7)
 # fatbeam.plot3d()
 
-fatbeam.filaments[1].pass_prim(E, B, geomT15, tmax=1e-5, invisible_wall_x=5.5, 
+fatbeam.filaments[15].pass_prim(E, B, geomT15, tmax=1e-5, invisible_wall_x=5.5, 
                                print_log=True)
 
-fatbeam_passed = fatbeam.pass_to_slits_parallel(fatbeam.filaments[1], E, B, geomT15, 
-                  target='slit', step_on_primary=1, slits=[3], any_traj=False, 
+fatbeam_passed = fatbeam.pass_to_slits_parallel_plus(fatbeam.filaments[15], E, B, geomT15, 
+                  target='slit', step_pass_sec=1000, slits=[3], any_traj=True, 
                   print_log=True)
 
 fatbeam_passed_list = []
