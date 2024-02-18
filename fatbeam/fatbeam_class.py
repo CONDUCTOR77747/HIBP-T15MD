@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 from matplotlib import path
 import matplotlib.pyplot as plt
+from joblib import Parallel, delayed # joblib=1.3.2; python>=3.11.6;
 
 #local imports
 import hibplib as hb
@@ -19,6 +20,56 @@ import hibpcalc.geomfunc as gf
 
 from hibpcalc.fields import __return_E as return_E
 from hibpcalc.misc import runge_kutt, argfind_rv, find_fork
+
+
+def pass_sec_parallel(old_tr, prim_point, rs, E, B, geom, slit_plane_n,
+ax_index, slits_spot_flat, slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, 
+any_traj=False, print_log=False):
+    #create an instance of trajectory with only 1 RV_prim point
+    tr = hb.Traj(old_tr.q, old_tr.m, old_tr.Ebeam, prim_point, old_tr.alpha, 
+                 old_tr.beta, old_tr.U)
+    tr.dt1 = old_tr.dt1 # dt for passing primary trajectory
+    tr.dt2 = old_tr.dt2 # dt for passing secondary trajectories
+    tr.I0 = old_tr.I0 # set I0 initial current distribution       
+    
+    tr.RV_prim = np.array([prim_point])
+    
+    # # take the point to start fan calculation
+    # RV_old = tr.RV_prim[0]
+    # RV_old = np.array([RV_old])
+    # RV_new = RV_old
+    
+    # # inside_slits_poly = False
+    
+    # # make a step on primary trajectory
+    # r = RV_old[:3]
+    
+    # # fields
+    # E_local = np.array([0., 0., 0.])
+    # B_local = B(r)
+    # if np.isnan(B_local).any():
+    #     if print_log:
+    #         print(f'Btor is nan, r = {r}')
+    #     return None
+    
+    # pass new secondary trajectory
+    tr.pass_sec(tr.RV_prim, rs, E, B, geom,
+                stop_plane_n=slit_plane_n, tmax=9e-5,
+                eps_xy=1e-3, eps_z=1, print_log=False)
+    
+    # check intersection with slits polygon
+    intersect_coords_flat = np.delete(tr.RV_sec[-1, :3], ax_index, 0)
+    contains_point = slits_spot_poly.contains_point(intersect_coords_flat)
+
+    # save result
+    if (not (True in tr.IntersectGeometrySec.values() or
+            tr.B_out_of_bounds) and contains_point) or any_traj:
+        # inside_slits_poly = True
+        return tr.RV_sec
+    # if not contains_point and inside_slits_poly:
+    #     return None
+
+
 
 class Fatbeam: 
     
@@ -29,10 +80,12 @@ class Fatbeam:
     geom: hb.Geometry
     Btor: float
     Ipl: float
+    dt1: float
+    dt2: float
     
     def __init__(self, traj: hb.Traj, E: dict, 
                  B: hc.fields.FieldInterpolator, geom: hb.Geometry,
-                Btor: float, Ipl: float) -> None:
+                Btor: float, Ipl: float, dt1:float=3e-10, dt2:float=3e-10) -> None:
 
         self.traj = traj
         self.filaments = []
@@ -43,6 +96,8 @@ class Fatbeam:
         self.Ipl = Ipl
         self.grid = []
         self.d_beam = 0.02
+        self.dt1 = dt1
+        self.dt2 = dt2
         
     def calc(self,  d_beam, foc_len, dt=2e-8, filaments=7, slits=[3], target='slits'):
         timestep_divider=20
@@ -176,8 +231,8 @@ class Fatbeam:
             v_rot = gf.rotate(v_rot, axis=(0, 1, 0), deg=tr.beta)
             
             new_tr = hb.Traj(tr.q, tr.m, tr.Ebeam, r0, tr.alpha, tr.beta, tr.U)
-            new_tr.dt1 = 0.7e-7 # dt for passing primary trajectory
-            new_tr.dt2 = 0.7e-7 # dt for passing secondary trajectories
+            new_tr.dt1 = self.dt1 # dt for passing primary trajectory
+            new_tr.dt2 = self.dt2 # dt for passing secondary trajectories
             new_tr.I0 = grid[2][i] # set I0 initial current distribution
             new_tr.RV0[0, :] = np.hstack([r_rot, v_rot])
             tr_fat_new_rv0.append(new_tr)
@@ -209,10 +264,100 @@ class Fatbeam:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
-        plt.show()
-        
+        plt.show()     
+    
     @staticmethod
-    def pass_to_slits(tr, dt, E, B, geom, target='slit', step_on_primary=1,timestep_divider=1,
+    def pass_to_slits_parallel(tr, E, B, geom, target='slit', step_on_primary=1,
+                      slits=range(7), any_traj=False, print_log=True):
+        '''
+        pass trajectories to slits and save secondaries which get into slits
+        '''
+        
+        # find the number of slits
+        n_slits = geom.plates_dict['an'].slits_edges.shape[0]
+        tr.add_slits(n_slits)
+        
+        # find slits position
+        if target == 'slit':
+            r_slits = geom.plates_dict['an'].slits_edges
+            rs = geom.r_dict['slit']
+            slit_plane_n = geom.plates_dict['an'].slit_plane_n
+            slits_spot = geom.plates_dict['an'].slits_spot
+        elif target == 'det':
+            r_slits = geom.plates_dict['an'].det_edges
+            rs = geom.r_dict['det']
+            slit_plane_n = geom.plates_dict['an'].det_plane_n
+            slits_spot = geom.plates_dict['an'].det_spot
+    
+        # create slits polygon
+        ax_index = np.argmax(slit_plane_n)
+        slits_spot_flat = np.delete(slits_spot, ax_index, 1)
+        slits_spot_poly = path.Path(slits_spot_flat)
+        
+        if print_log:
+            print('\nStarting precise fan calculation')
+        
+        # number of steps during new fan calculation
+        n_steps = len(tr.RV_prim)
+        
+        # list for new trajectories
+        fan_list = []
+
+        # geometry mask
+        # check eliptical radius of particle:
+        # 1.5 m - major radius of a torus, elon - size along Y
+        masked_list = []
+        for primary_point in tr.RV_prim:
+            if np.sqrt((primary_point[0] - geom.R)**2 + 
+                       (primary_point[1] / geom.elon)**2) > geom.r_plasma:
+                # masked_list.append(None)
+                continue
+            masked_list.append(primary_point)
+            
+        print(f'Primary points: {len(masked_list)}')
+        
+        # main calc multiprocessing using joblib=1.3.2
+        fan_list = Parallel(n_jobs=-1, verbose=5)(delayed(pass_sec_parallel)(tr,
+        primary_point, rs, E, B, geom, slit_plane_n, ax_index, slits_spot_flat,
+        slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, any_traj=any_traj, 
+        print_log=False) for primary_point in masked_list)
+        
+        if print_log:
+            print('\nPrecise fan calculated')
+    
+        # choose secondaries which get into slits
+        # start slit cycle
+        for i_slit in slits:
+            if print_log:
+                print('\nslit = {}'.format(i_slit+1))
+                print('center of the slit = ', r_slits[i_slit, 0, :], '\n')
+    
+            # create slit polygon
+            slit_flat = np.delete(r_slits[i_slit, 1:, :], ax_index, 1)
+            slit_poly = path.Path(slit_flat)
+            zones_list = []  # list for ion zones coordinates
+            rv_list = []  # list for RV arrays of secondaries
+    
+            for fan_tr in fan_list:
+                try:
+                    # get last coordinates of the secondary trajectory
+                    intersect_coords_flat = np.delete(fan_tr[-1, :3], ax_index, 0)
+                    if slit_poly.contains_point(intersect_coords_flat) or any_traj:
+                        if print_log:
+                            print('slit {} ok!\n'.format(i_slit+1))
+                        rv_list.append(fan_tr)
+                        zones_list.append(fan_tr[0, :3])
+                except:
+                    continue
+    
+            tr.RV_sec_toslits[i_slit] = rv_list
+            tr.ion_zones[i_slit] = np.array(zones_list)
+        tr.fan_to_slits = fan_list
+    
+        return tr
+    
+    @staticmethod
+    def pass_to_slits(tr, E, B, geom, target='slit', step_on_primary=1,
                       slits=range(7), any_traj=False, print_log=True):
         '''
         pass trajectories to slits and save secondaries which get into slits
@@ -248,9 +393,9 @@ class Fatbeam:
             print('\nStarting precise fan calculation')
             
         # divide the timestep
-        tr.dt1 = dt
-        tr.dt2 = dt
-        k = tr.q / tr.m
+        # tr.dt1 = dt
+        # tr.dt2 = dt
+        # k = tr.q / tr.m
         
         # for i in range(len(tr.RV_prim)):
         #     print("check", tr.RV_prim[i, 0], tr.RV_prim[i, 1])
@@ -268,7 +413,7 @@ class Fatbeam:
         RV_new = RV_old
         
         inside_slits_poly = False
-        for i_steps in tqdm(range(1, n_steps, step_on_primary)):
+        for i_steps in tqdm(range(0, n_steps, step_on_primary)):
             
             # geometry mask
             # check eliptical radius of particle:
@@ -277,11 +422,6 @@ class Fatbeam:
                         (tr.RV_prim[i_steps, 1] / geom.elon)**2) > geom.r_plasma:
                 # print(tr.RV_prim[i_steps, 0], tr.RV_prim[i_steps, 1], 'skipped', f'i={i_steps}')
                 continue
-            
-            # pass new secondary trajectory
-            tr.pass_sec(RV_new, rs, E, B, geom,
-                        stop_plane_n=slit_plane_n, tmax=9e-5,
-                        eps_xy=1e-3, eps_z=1, print_log=False)
             
             # make a step on primary trajectory
             r = RV_old[0, :3]
@@ -295,63 +435,31 @@ class Fatbeam:
                 break
     
             # runge-kutta step
-            RV_new2 = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
+            # RV_new2 = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
             RV_new = np.array([tr.RV_prim[i_steps]])
-            print("compare", RV_new, RV_new2, sep='\n')
+            # print("compare", RV_new, RV_new2, sep='\n')
             RV_old = RV_new
+            
+            
+            # pass new secondary trajectory
+            tr.pass_sec(RV_new, rs, E, B, geom,
+                        stop_plane_n=slit_plane_n, tmax=9e-5,
+                        eps_xy=1e-3, eps_z=1, print_log=False)
+            
     
             # check intersection with slits polygon
             intersect_coords_flat = np.delete(tr.RV_sec[-1, :3], ax_index, 0)
             contains_point = slits_spot_poly.contains_point(intersect_coords_flat)
     
             # save result
-            if not (True in tr.IntersectGeometrySec.values() or
-                    tr.B_out_of_bounds) and contains_point:
+            if (not (True in tr.IntersectGeometrySec.values() or
+                    tr.B_out_of_bounds) and contains_point) or any_traj:
                 inside_slits_poly = True
                 fan_list.append(tr.RV_sec)
-            if not contains_point and inside_slits_poly:
-                break
+            # if not contains_point and inside_slits_poly:
+            #     break
         if print_log:
             print('\nPrecise fan calculated')
-        
-        # i_steps = 1
-        # inside_slits_poly = False
-        # while i_steps <= n_steps:
-        #     # pass new secondary trajectory
-        #     tr.pass_sec(RV_new, rs, E, B, geom,
-        #                 stop_plane_n=slit_plane_n, tmax=9e-5,
-        #                 eps_xy=1e-3, eps_z=1, print_log=False)
-    
-        #     # make a step on primary trajectory
-        #     r = RV_old[0, :3]
-            
-        #     # fields
-        #     E_local = np.array([0., 0., 0.])
-        #     B_local = B(r)
-        #     if np.isnan(B_local).any():
-        #         if print_log:
-        #             print('Btor is nan, r = %s' % str(r))
-        #         break
-    
-        #     # runge-kutta step
-        #     # RV_new = runge_kutt(k, RV_old, tr.dt1, E_local, B_local)
-        #     RV_new = np.array([tr.RV_prim[i_steps]])
-        #     RV_old = RV_new
-        #     i_steps += 1
-    
-        #     # check intersection with slits polygon
-        #     intersect_coords_flat = np.delete(tr.RV_sec[-1, :3], ax_index, 0)
-        #     contains_point = slits_spot_poly.contains_point(intersect_coords_flat)
-    
-        #     # save result
-        #     if not (True in tr.IntersectGeometrySec.values() or
-        #             tr.B_out_of_bounds) and contains_point:
-        #         inside_slits_poly = True
-        #         fan_list.append(tr.RV_sec)
-        #     if not contains_point and inside_slits_poly:
-        #         break
-        # if print_log:
-        #     print('\nPrecise fan calculated')
     
         # choose secondaries which get into slits
         # start slit cycle
@@ -381,6 +489,8 @@ class Fatbeam:
     
         return tr
 
+
+
  # fatbeam_kwargs = {'Ebeam_orig':'260',
  #                   'UA2_orig':'10',
  #                   'target':'slit',
@@ -400,8 +510,6 @@ class Fatbeam:
  #                   'close_plots': close_plots,
  #                   'save_plots': save_plots,
  #                   'create_table': False}
-
-
 
 if __name__=='__main__':
     

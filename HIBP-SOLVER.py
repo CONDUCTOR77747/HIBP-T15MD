@@ -742,18 +742,16 @@ if pass2AN:
 #%% fatbeam calculation
 
 traj_list_optimized = copy.deepcopy(traj_list_passed)
-fatbeam = fb.Fatbeam(traj_list_optimized[0], E, B, geomT15, Btor, Ipl)
+
+fatbeam = fb.Fatbeam(traj_list_optimized[0], E, B, geomT15, Btor, Ipl, dt1=3e-10, dt2=3e-10)
 fatbeam._set_new_RV0s(0.02, 50, n=7)
 # fatbeam.plot3d()
-r_aim = geomT15.r_dict['r0'] # geomT15.r_dict['an']
 
-fatbeam.filaments[0].dt1 = 3e-8
-
-fatbeam.filaments[0].pass_prim(E, B, geomT15, tmax=1e-5, invisible_wall_x=5.5, 
+fatbeam.filaments[1].pass_prim(E, B, geomT15, tmax=1e-5, invisible_wall_x=5.5, 
                                print_log=True)
 
-fatbeam_passed = fatbeam.pass_to_slits(fatbeam.filaments[0], 3e-8, E, B, geomT15, 
-                  target='slit', timestep_divider=1, slits=[3], any_traj=True, 
+fatbeam_passed = fatbeam.pass_to_slits_parallel(fatbeam.filaments[1], E, B, geomT15, 
+                  target='slit', step_on_primary=1, slits=[3], any_traj=False, 
                   print_log=True)
 
 fatbeam_passed_list = []

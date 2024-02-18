@@ -17,8 +17,8 @@ from joblib import Parallel, delayed # joblib=1.3.2; python>=3.11.6;
 from matplotlib.patches import Rectangle
 from tqdm import tqdm
 
-import hibpplotlib as hbplot
 import optimizers
+import hibpplotlib as hbplot
 import hibpcalc.geomfunc as gf
 
 #from hibpcalc.fields import return_E
