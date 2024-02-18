@@ -22,15 +22,15 @@ from hibpcalc.fields import __return_E as return_E
 from hibpcalc.misc import runge_kutt, argfind_rv, find_fork
 
 
-def pass_sec_parallel(old_tr, prim_point, rs, E, B, geom, slit_plane_n,
+def pass_sec_parallel(tr, prim_point, rs, E, B, geom, slit_plane_n,
 ax_index, slits_spot_flat, slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, 
 any_traj=False, print_log=False):
     #create an instance of trajectory with only 1 RV_prim point
-    tr = hb.Traj(old_tr.q, old_tr.m, old_tr.Ebeam, prim_point, old_tr.alpha, 
-                 old_tr.beta, old_tr.U)
-    tr.dt1 = old_tr.dt1 # dt for passing primary trajectory
-    tr.dt2 = old_tr.dt2 # dt for passing secondary trajectories
-    tr.I0 = old_tr.I0 # set I0 initial current distribution       
+    # tr = hb.Traj(old_tr.q, old_tr.m, old_tr.Ebeam, prim_point, old_tr.alpha, 
+    #              old_tr.beta, old_tr.U)
+    # tr.dt1 = old_tr.dt1 # dt for passing primary trajectory
+    # tr.dt2 = old_tr.dt2 # dt for passing secondary trajectories
+    # tr.I0 = old_tr.I0 # set I0 initial current distribution       
     
     tr.RV_prim = np.array([prim_point])
     
@@ -266,8 +266,6 @@ class Fatbeam:
         ax.set_zlabel('Z')
         plt.show()     
     
-    
-    
     @staticmethod
     def pass_to_slits_parallel_plus(tr, E, B, geom, target='slit', step_pass_sec=1,
                       slits=range(7), any_traj=False, print_log=True):
@@ -322,7 +320,8 @@ class Fatbeam:
         step = step_pass_sec
         masked_list = [masked_list_0[i] for i in range(start, stop, step)]
             
-        print(f'Primary points: {len(masked_list)}, dt1: {tr.dt1}, dt2: {tr.dt2}')
+        if print_log:
+            print(f'Primary points: {len(masked_list)}, dt1: {tr.dt1}, dt2: {tr.dt2}')
         
         # main calc multiprocessing using joblib=1.3.2
         fan_list = Parallel(n_jobs=-1, verbose=5)(delayed(pass_sec_parallel)(tr,
@@ -345,7 +344,28 @@ class Fatbeam:
                     precise_diapason_list.append(traj)
                     break
         
-        fan_list = precise_diapason_list
+        # fan_list = [precise_diapason_list[0], precise_diapason_list[-1]]
+        
+        # fan_list = precise_diapason_list
+        
+        masked_list = []
+        start = np.where(tr.RV_prim==precise_diapason_list[0][0])[0][0]
+        stop = np.where(tr.RV_prim==precise_diapason_list[-1][0])[0][0]
+        step = 100
+        
+        masked_list = [tr.RV_prim[i] for i in range(start, stop, step)]
+        
+        if print_log:   
+            print(f'Primary points 2: {len(masked_list)}, dt1: {tr.dt1}, dt2: {tr.dt2}')
+        
+        # main calc multiprocessing using joblib=1.3.2
+        fan_list = Parallel(n_jobs=-1, verbose=5)(delayed(pass_sec_parallel)(tr,
+        primary_point, rs, E, B, geom, slit_plane_n, ax_index, slits_spot_flat,
+        slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, any_traj=any_traj, 
+        print_log=False) for primary_point in masked_list)
+        
+        if print_log:
+            print('\nPrecise fan calculated')
         
         # choose secondaries which get into slits
         # start slit cycle
