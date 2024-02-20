@@ -21,7 +21,6 @@ import hibpcalc.geomfunc as gf
 from hibpcalc.fields import __return_E as return_E
 from hibpcalc.misc import runge_kutt, argfind_rv, find_fork
 
-
 def pass_sec_parallel(tr, prim_point, rs, E, B, geom, slit_plane_n,
 ax_index, slits_spot_flat, slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, 
 any_traj=False, print_log=False):
@@ -69,6 +68,58 @@ any_traj=False, print_log=False):
     # if not contains_point and inside_slits_poly:
     #     return None
 
+def find_diapason(tr, fan_list, intersect_geom_list, step, rs, E, B, geom, 
+                  slit_plane_n, ax_index, slits_spot_flat, slits_spot_poly,
+                  s_s_s = None, any_traj=False, print_log=False):
+    
+    # choose secondaries which bump into geometry from intersect_geom_list
+    precise_diapason_list = []
+    if intersect_geom_list:
+        for traj in fan_list:
+            intersected = False
+            
+            for i in range(len(traj)-1):
+                if intersected:
+                    break
+                point1 = traj[i, :3]
+                point2 = traj[i+1, :3]
+                    
+                for intersect_geom in intersect_geom_list:
+                    if intersect_geom.check_intersect(point1, point2):
+                        precise_diapason_list.append(traj)
+                        intersected = True
+                        break
+    
+    # setup start and stop index (and step) of primary traj. for passing secondaries
+    if s_s_s is None:
+        start = np.where(tr.RV_prim==precise_diapason_list[0][0])[0][0]
+        stop = np.where(tr.RV_prim==precise_diapason_list[-1][0])[0][0]
+        step = step
+        masked_list = [tr.RV_prim[i] for i in range(start, stop, step)]
+    else:
+        start = s_s_s[0]
+        stop = s_s_s[1]
+        step = s_s_s[2]
+        if stop == -1:
+            stop = len(tr.RV_prim)
+            masked_list = [tr.RV_prim[i] for i in range(start, stop, step)]
+        else:
+            masked_list = [tr.RV_prim[i] for i in range(start, stop, step)]
+        
+    if print_log:   
+        print(f'Primary points: {len(masked_list)}, dt1: {tr.dt1}, dt2: {tr.dt2}')
+    
+    # main calc multiprocessing using joblib=1.3.2
+    # pass secondary traj. in parallel
+    fan_list = Parallel(n_jobs=-1, verbose=5)(delayed(pass_sec_parallel)(tr,
+    primary_point, rs, E, B, geom, slit_plane_n, ax_index, slits_spot_flat,
+    slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, any_traj=any_traj, 
+    print_log=False) for primary_point in masked_list)
+    
+    if print_log:
+        print('\nPrecise fan calculated')
+        
+    return fan_list, precise_diapason_list
 
 
 class Fatbeam: 
@@ -266,8 +317,141 @@ class Fatbeam:
         ax.set_zlabel('Z')
         plt.show()     
     
+    
+    
     @staticmethod
     def pass_to_slits_parallel_plus(tr, E, B, geom, target='slit', step_pass_sec=1,
+                      slits=range(7), any_traj=False, print_log=True):
+        '''
+        pass trajectories to slits and save secondaries which get into slits
+        '''
+        
+        # find the number of slits
+        n_slits = geom.plates_dict['an'].slits_edges.shape[0]
+        tr.add_slits(n_slits)
+        
+        # find slits position
+        if target == 'slit':
+            r_slits = geom.plates_dict['an'].slits_edges
+            rs = geom.r_dict['slit']
+            slit_plane_n = geom.plates_dict['an'].slit_plane_n
+            slits_spot = geom.plates_dict['an'].slits_spot
+        elif target == 'det':
+            r_slits = geom.plates_dict['an'].det_edges
+            rs = geom.r_dict['det']
+            slit_plane_n = geom.plates_dict['an'].det_plane_n
+            slits_spot = geom.plates_dict['an'].det_spot
+    
+        # create slits polygon
+        ax_index = np.argmax(slit_plane_n)
+        slits_spot_flat = np.delete(slits_spot, ax_index, 1)
+        slits_spot_poly = path.Path(slits_spot_flat)
+        
+        if print_log:
+            print('\nStarting precise fan calculation')
+        
+        # number of steps during new fan calculation
+        n_steps = len(tr.RV_prim)
+        
+        # list for new trajectories
+        fan_list = []
+
+        # geometry mask
+        # check eliptical radius of particle:
+        # 1.5 m - major radius of a torus, elon - size along Y
+        masked_list_0 = []
+        for i in range(len(tr.RV_prim)):
+            if np.sqrt((tr.RV_prim[i, 0] - geom.R)**2 + 
+                       (tr.RV_prim[i, 1] / geom.elon)**2) > geom.r_plasma:
+                # masked_list.append(None)
+                continue
+            masked_list_0.append(tr.RV_prim[i])
+        
+        # first step. along ALL primary traj.
+        masked_list = []
+        start = 0
+        stop = len(masked_list_0)
+        step = step_pass_sec
+        masked_list = [masked_list_0[i] for i in range(start, stop, step)]
+            
+        if print_log:
+            print(f'Primary points: {len(masked_list)}, dt1: {tr.dt1}, dt2: {tr.dt2}')
+        
+        # main calc multiprocessing using joblib=1.3.2
+        fan_list = Parallel(n_jobs=-1, verbose=5)(delayed(pass_sec_parallel)(tr,
+        primary_point, rs, E, B, geom, slit_plane_n, ax_index, slits_spot_flat,
+        slits_spot_poly, tmax=9e-5, eps_xy=1e-3, eps_z=1, any_traj=any_traj, 
+        print_log=False) for primary_point in masked_list)
+        
+        # second step. between A3 plates
+        intersect_geom_list = [geom.plates_dict['A3'], geom.plates_dict['A3d']]
+        step = 100
+        fan_list, precise_diapason_list = find_diapason(tr, fan_list, 
+                        intersect_geom_list, step, rs, E, B, geom, 
+                          slit_plane_n, ax_index, slits_spot_flat, slits_spot_poly, 
+                          s_s_s=None, any_traj=any_traj, print_log=print_log)
+        
+        # thrid step. between A4 plates
+        intersect_geom_list = [geom.plates_dict['A4'], geom.plates_dict['A4d']]
+        step = 100
+        fan_list, precise_diapason_list = find_diapason(tr, fan_list, 
+                        intersect_geom_list, step, rs, E, B, geom, 
+                          slit_plane_n, ax_index, slits_spot_flat, slits_spot_poly, 
+                          s_s_s=None, any_traj=any_traj, print_log=print_log)
+        
+        # fourth step. between ENTIRE slit plate
+        # intersect_geom_list = [geom.plates_dict['an']]
+        # step = 100
+        # fan_list, precise_diapason_list = find_diapason(tr, fan_list, 
+        #                 intersect_geom_list, step, rs, E, B, geom, 
+        #                   slit_plane_n, ax_index, slits_spot_flat, slits_spot_poly, 
+        #                   s_s_s=None, any_traj=any_traj, print_log=print_log)
+        
+        # # check intersection with slits polygon
+        # intersect_coords_flat = np.delete(tr.RV_sec[-1, :3], ax_index, 0)
+        # contains_point = slits_spot_poly.contains_point(intersect_coords_flat)
+
+        # # save result
+        # if (not (True in tr.IntersectGeometrySec.values() or
+        #         tr.B_out_of_bounds) and contains_point) or any_traj:
+        #     inside_slits_poly = True
+        #     fan_list.append(tr.RV_sec)
+        # # if not contains_point and inside_slits_poly:
+        # #     break
+        
+        # choose secondaries which get into slits
+        # start slit cycle
+        for i_slit in slits:
+            if print_log:
+                print('\nslit = {}'.format(i_slit+1))
+                print('center of the slit = ', r_slits[i_slit, 0, :], '\n')
+    
+            # create slit polygon
+            slit_flat = np.delete(r_slits[i_slit, 1:, :], ax_index, 1)
+            slit_poly = path.Path(slit_flat)
+            zones_list = []  # list for ion zones coordinates
+            rv_list = []  # list for RV arrays of secondaries
+    
+            for fan_tr in fan_list:
+                try:
+                    # get last coordinates of the secondary trajectory
+                    intersect_coords_flat = np.delete(fan_tr[-1, :3], ax_index, 0)
+                    if slit_poly.contains_point(intersect_coords_flat) or any_traj:
+                        if print_log:
+                            print('slit {} ok!\n'.format(i_slit+1))
+                        rv_list.append(fan_tr)
+                        zones_list.append(fan_tr[0, :3])
+                except:
+                    continue
+    
+            tr.RV_sec_toslits[i_slit] = rv_list
+            tr.ion_zones[i_slit] = np.array(zones_list)
+        tr.fan_to_slits = fan_list
+    
+        return tr
+    
+    @staticmethod
+    def pass_to_slits_parallel_plus_old(tr, E, B, geom, target='slit', step_pass_sec=1,
                       slits=range(7), any_traj=False, print_log=True):
         '''
         pass trajectories to slits and save secondaries which get into slits

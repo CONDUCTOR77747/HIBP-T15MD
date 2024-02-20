@@ -240,19 +240,21 @@ class Traj():
                 # raise Exception("???")
 
                 break
+            
+            # if geom.check_chamb_intersect('prim', RV_old[0, 0:3],
+            #                               RV_new[0, 0:3]):
+            #     # print('Secondary intersected chamber exit')
+            #     self.IntersectGeometrySec['chamb'] = True
+            #     # break
 
-            if geom.check_chamb_intersect('sec', RV_old[0, 0:3],
-                                          RV_new[0, 0:3]):
-                # print('Secondary intersected chamber exit')
-                self.IntersectGeometrySec['chamb'] = True
-
-            plts_flag, plts_name = geom.check_plates_intersect(
-                RV_old[0, 0:3], RV_new[0, 0:3])
-            if plts_flag:
-                if print_log:
-                    self.print_log('Secondary intersected ' +
-                                   plts_name + ' plates')
-                self.IntersectGeometrySec[plts_name] = True
+            # plts_flag, plts_name = geom.check_plates_intersect(
+            #     RV_old[0, 0:3], RV_new[0, 0:3])
+            # if plts_flag:
+            #     if print_log:
+            #         self.print_log('Secondary intersected ' +
+            #                        plts_name + ' plates')
+            #     self.IntersectGeometrySec[plts_name] = True
+            #     # break
 
             # find last point of the secondary trajectory
             # if (RV_new[0, 0] > 2.45) and (RV_new[0, 1] < 1.5):

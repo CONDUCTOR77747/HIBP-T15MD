@@ -757,3 +757,9 @@ fatbeam_passed = fatbeam.pass_to_slits_parallel_plus(fatbeam.filaments[15], E, B
 fatbeam_passed_list = []
 fatbeam_passed_list.append(fatbeam_passed)
 hbplot.plot_fatbeam(fatbeam_passed_list, geomT15, Btor, Ipl, n_slit=3, scale=3)
+
+#%%
+
+fig, ax = plt.subplots()
+geomT15.plates_dict['an'].plot(ax)
+
